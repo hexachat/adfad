@@ -1,187 +1,66 @@
+require('dotenv').config();
 const express = require('express');
-const http = require('http');
-const https = require('https');
+const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
-const fs = require('fs');
 const jwt = require('jsonwebtoken');
-const { Server } = require('socket.io');
-require('dotenv').config();
-
 const supabase = require('./config/supabase');
-const { formatUser, USER_PUBLIC_SELECT, fetchUserById } = require('./config/user-fields');
-const { addCall } = require('./store/call-store');
+const { createServer } = require('./config/https');
 
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
 const contactRoutes = require('./routes/contacts');
-const groupRoutes = require('./routes/groups');
 const messageRoutes = require('./routes/messages');
-const statusRoutes = require('./routes/status');
+const groupRoutes = require('./routes/groups');
+const statusRoutes = require('./routes/statuses');
 const callRoutes = require('./routes/calls');
-const { getIceServerConfig, getIceServerConfigSync } = require('./lib/webrtc-ice');
-
-function getAllowedOrigins() {
-  const defaults = [
-    'https://hexachat2.netlify.app',
-    'http://localhost:3000',
-    'https://localhost:3000',
-    'http://127.0.0.1:3000',
-    'https://127.0.0.1:3000'
-  ];
-  const raw = process.env.FRONTEND_URL || defaults.join(',');
-  const fromEnv = raw
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return [...new Set([...defaults, ...fromEnv])];
-}
-
-const allowedOrigins = getAllowedOrigins();
-
-function corsOrigin(origin, callback) {
-  if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
-    callback(null, true);
-    return;
-  }
-  if (
-    /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|101\.101\.\d{1,3}\.\d{1,3})(:\d+)?$/.test(
-      origin
-    )
-  ) {
-    callback(null, true);
-    return;
-  }
-  callback(null, allowedOrigins[0]);
-}
+const voiceRoutes = require('./routes/voice');
 
 const app = express();
-const useLocalHttps = process.env.USE_LOCAL_HTTPS === 'true';
+const { server, protocol } = createServer(app);
 
-let server;
-if (useLocalHttps) {
-  const { ensureCerts } = require('./lib/https-certs');
-  server = https.createServer(ensureCerts(), app);
-} else {
-  server = http.createServer(app);
-}
+// Share io with routes
+app.set('io', null);
 
 const io = new Server(server, {
   cors: {
-    origin: allowedOrigins.includes('*') ? '*' : allowedOrigins,
-    methods: ['GET', 'POST'],
-    credentials: true
-  },
-  pingTimeout: 120000,
-  pingInterval: 25000,
-  connectTimeout: 45000,
-  transports: ['websocket', 'polling']
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
 });
 
-app.use(cors({ origin: corsOrigin, credentials: true }));
-app.use((req, res, next) => {
-  res.setHeader('Permissions-Policy', 'microphone=*, camera=*');
-  next();
-});
+app.set('io', io);
+
+app.use(cors({ origin: '*' }));
 app.use(express.json());
-
-const uploadsDir = path.join(__dirname, 'uploads');
-const statusUploadsDir = path.join(uploadsDir, 'status');
-const dataDir = path.join(__dirname, 'data');
-[uploadsDir, statusUploadsDir, dataDir].forEach((dir) => {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-});
-
-app.use('/uploads', express.static(uploadsDir));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/contacts', contactRoutes);
-app.use('/api/groups', groupRoutes);
 app.use('/api/messages', messageRoutes);
-app.use('/api/status', statusRoutes);
+app.use('/api/voice', voiceRoutes);
+app.use('/api/groups', groupRoutes);
+app.use('/api/statuses', statusRoutes);
 app.use('/api/calls', callRoutes);
 
-app.get('/', (_, res) => {
+app.get('/api/health', async (req, res) => {
+  const { error } = await supabase.from('users').select('id').limit(1);
   res.json({
-    app: 'HexaChat API',
-    status: 'running',
-    health: '/api/health',
-    frontend: process.env.FRONTEND_URL || 'https://hexachat2.netlify.app'
+    status: 'ok',
+    app: 'HexaChat',
+    version: '25',
+    database: error ? 'error' : 'connected',
+    dbError: error?.message || null
   });
 });
 
-app.get('/api/health', (_, res) => res.json({ status: 'ok', app: 'HexaChat' }));
-
-app.get('/api/webrtc/ice', async (_, res) => {
-  try {
-    const config = await getIceServerConfig();
-    res.json(config);
-  } catch (err) {
-    console.error('ICE config error:', err);
-    res.json(getIceServerConfigSync());
-  }
-});
-
-app.get('/api/network', (_, res) => {
-  if (useLocalHttps) {
-    const { getLanIp } = require('./lib/https-certs');
-    const ip = getLanIp();
-    res.json({
-      lan_ip: ip,
-      frontend: `https://${ip}:3000`,
-      backend: `https://${ip}:5000`,
-      secure_context: true
-    });
-    return;
-  }
-  res.json({
-    mode: 'production',
-    backend: process.env.RAILWAY_PUBLIC_DOMAIN
-      ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-      : 'Railway',
-    frontend: process.env.FRONTEND_URL || 'https://hexachat2.netlify.app'
-  });
-});
-
-const onlineUsers = new Map();
-const callSessions = new Map();
-
-function addOnlineUser(userId, socketId) {
-  if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
-  onlineUsers.get(userId).add(socketId);
-}
-
-function removeOnlineUser(userId, socketId) {
-  const set = onlineUsers.get(userId);
-  if (!set) return;
-  set.delete(socketId);
-  if (!set.size) onlineUsers.delete(userId);
-}
-
-function emitToUser(userId, event, data) {
-  const sockets = onlineUsers.get(userId);
-  if (!sockets) return;
-  for (const sid of sockets) {
-    io.to(sid).emit(event, data);
-  }
-}
-
-function clearCallSession(userId) {
-  const session = callSessions.get(userId);
-  if (!session) return;
-  callSessions.delete(userId);
-  callSessions.delete(session.with);
-}
-
-function setCallSession(userA, userB) {
-  callSessions.set(userA, { with: userB });
-  callSessions.set(userB, { with: userA });
-}
+// Socket.io online users map
+const onlineUsers = new Map(); // userId -> socketId
 
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
-  if (!token) return next(new Error('Unauthorized'));
+  if (!token) return next(new Error('Auth required'));
   try {
     socket.user = jwt.verify(token, process.env.JWT_SECRET);
     next();
@@ -190,211 +69,200 @@ io.use((socket, next) => {
   }
 });
 
-io.on('connection', (socket) => {
+io.on('connection', async (socket) => {
   const userId = socket.user.id;
-  addOnlineUser(userId, socket.id);
+  onlineUsers.set(userId, socket.id);
+
+  await supabase.from('users').update({ is_online: true, last_seen: new Date().toISOString() }).eq('id', userId);
   io.emit('user_online', { userId });
-  socket.emit('online_users', { userIds: Array.from(onlineUsers.keys()) });
 
-  socket.on('send_message', async (data, callback) => {
-    try {
-      const { receiver_id, group_id, content, message_type } = data;
-      if (!content || (!receiver_id && !group_id)) {
-        if (callback) callback({ success: false, error: 'Invalid message data' });
-        return;
-      }
+  // Join personal room
+  socket.join(`user:${userId}`);
 
-      const insert = {
-        sender_id: userId,
-        content: String(content).trim(),
-        message_type: message_type || 'text'
-      };
-      
-      if (group_id) insert.group_id = group_id;
-      else insert.receiver_id = receiver_id;
+  // Join group rooms
+  const { data: groups } = await supabase
+    .from('group_members')
+    .select('group_id')
+    .eq('user_id', userId);
 
-      const { data: message, error } = await supabase
-        .from('messages')
-        .insert(insert)
-        .select('*')
-        .single();
+  for (const g of (groups || [])) {
+    socket.join(`group:${g.group_id}`);
+  }
 
-      if (error) {
-        console.error('Message insert error:', error);
-        throw error;
-      }
+  // Send message
+  socket.on('send_message', async (data) => {
+    const { receiver_id, group_id, content, message_type = 'text', media_url = null } = data;
+    const msg = {
+      sender_id: userId,
+      content: content || (message_type === 'audio' ? 'Voice message' : ''),
+      message_type,
+      is_read: false
+    };
+    if (media_url) msg.media_url = media_url;
+    if (receiver_id) msg.receiver_id = receiver_id;
+    if (group_id) msg.group_id = group_id;
 
-      message.sender = await fetchUserById(supabase, userId);
+    const { data: message } = await supabase.from('messages').insert(msg).select('*').single();
+    if (!message) return;
 
-      if (group_id) {
-        const { data: members } = await supabase
-          .from('group_members')
-          .select('user_id')
-          .eq('group_id', group_id);
+    if (group_id) {
+      io.to(`group:${group_id}`).emit('new_message', { message, sender: socket.user });
+      // Notify each member
+      const { data: members } = await supabase
+        .from('group_members')
+        .select('user_id')
+        .eq('group_id', group_id)
+        .neq('user_id', userId);
 
-        for (const m of members || []) {
-          emitToUser(m.user_id, 'new_message', { message, group_id });
-          if (m.user_id !== userId) {
-            emitToUser(m.user_id, 'notification', {
-              type: 'message',
-              title: message.sender?.name || 'HexaChat',
-              body: content,
-              group_id
-            });
-          }
+      for (const m of (members || [])) {
+        const sid = onlineUsers.get(m.user_id);
+        if (sid) {
+          io.to(sid).emit('notification', {
+            type: 'message',
+            title: 'Group Message',
+            body: content,
+            data: { group_id, message_id: message.id }
+          });
         }
-      } else {
-        emitToUser(receiver_id, 'new_message', { message, sender_id: userId });
-        emitToUser(receiver_id, 'notification', {
+      }
+    } else if (receiver_id) {
+      const receiverSocket = onlineUsers.get(receiver_id);
+      if (receiverSocket) {
+        io.to(receiverSocket).emit('new_message', { message, sender: socket.user });
+        io.to(receiverSocket).emit('notification', {
           type: 'message',
-          title: message.sender?.name || 'HexaChat',
+          title: socket.user.name || 'New Message',
           body: content,
-          sender_id: userId
+          data: { sender_id: userId, message_id: message.id }
         });
       }
-
-      if (callback) callback({ success: true, message });
-    } catch (err) {
-      console.error('Send message error:', err);
-      if (callback) callback({ success: false, error: err.message || 'Failed to send' });
+      socket.emit('message_sent', { message });
     }
   });
 
+  // Typing indicator
   socket.on('typing', ({ receiver_id, group_id, isTyping }) => {
+    if (receiver_id) {
+      const sid = onlineUsers.get(receiver_id);
+      if (sid) io.to(sid).emit('typing', { userId, isTyping });
+    }
     if (group_id) {
-      socket.broadcast.emit('user_typing', { userId, group_id, isTyping });
-    } else if (receiver_id) {
-      emitToUser(receiver_id, 'user_typing', { userId, isTyping });
+      socket.to(`group:${group_id}`).emit('typing', { userId, isTyping });
     }
   });
 
-  socket.on('call_user', async ({ receiver_id, call_type, offer }) => {
-    try {
-      if (!receiver_id || receiver_id === userId || !offer?.sdp) {
-        socket.emit('call_unavailable', { receiver_id });
-        return;
-      }
+  // Mark messages read
+  socket.on('mark_read', async ({ sender_id }) => {
+    await supabase.from('messages')
+      .update({ is_read: true })
+      .eq('sender_id', sender_id)
+      .eq('receiver_id', userId)
+      .eq('is_read', false);
 
-      if (callSessions.has(userId)) {
-        socket.emit('call_busy', { receiver_id });
-        return;
-      }
-      if (callSessions.has(receiver_id)) {
-        socket.emit('call_busy', { receiver_id });
-        return;
-      }
+    const sid = onlineUsers.get(sender_id);
+    if (sid) io.to(sid).emit('messages_read', { reader_id: userId });
+  });
 
-      const receiverSockets = onlineUsers.get(receiver_id);
-      if (!receiverSockets || !receiverSockets.size) {
-        socket.emit('call_unavailable', { receiver_id });
-        return;
-      }
-
-      const caller = await fetchUserById(supabase, userId);
-      setCallSession(userId, receiver_id);
-
-      emitToUser(receiver_id, 'incoming_call', {
-        caller,
-        call_type: call_type || 'audio',
-        offer,
-        caller_id: userId
+  // WebRTC Call Signaling
+  socket.on('call_user', async ({ receiver_id, call_type, call_id }) => {
+    const receiverSocket = onlineUsers.get(receiver_id);
+    if (receiverSocket) {
+      io.to(receiverSocket).emit('incoming_call', {
+        caller_id: userId,
+        caller_name: socket.user.name,
+        call_type,
+        call_id,
+        caller_socket: socket.id
       });
-      socket.emit('call_ringing', { receiver_id });
-    } catch (err) {
-      console.error('call_user error:', err);
-      clearCallSession(userId);
-      socket.emit('call_unavailable', { receiver_id });
+    } else {
+      // User offline - log missed call
+      await supabase.from('calls').insert({
+        caller_id: userId,
+        receiver_id,
+        call_type: call_type || 'audio',
+        status: 'missed',
+        ended_at: new Date().toISOString()
+      });
+      socket.emit('call_failed', { reason: 'User offline' });
     }
   });
 
-  socket.on('call_answer', ({ caller_id, answer }) => {
-    if (!caller_id || !answer?.sdp) return;
-    emitToUser(caller_id, 'call_answered', { answer, receiver_id: userId });
-  });
-
-  socket.on('call_busy', ({ caller_id }) => {
-    if (caller_id) {
-      clearCallSession(caller_id);
-      emitToUser(caller_id, 'call_busy', { receiver_id: userId });
+  socket.on('answer_call', ({ caller_id, call_id, answer }) => {
+    const callerSocket = onlineUsers.get(caller_id);
+    if (callerSocket) {
+      io.to(callerSocket).emit('call_answered', {
+        answerer_id: userId,
+        call_id,
+        answer,
+        answerer_socket: socket.id
+      });
     }
   });
 
   socket.on('ice_candidate', ({ target_id, candidate }) => {
-    if (target_id && candidate) {
-      emitToUser(target_id, 'ice_candidate', { candidate, from_id: userId });
+    const targetSocket = onlineUsers.get(target_id);
+    if (targetSocket) {
+      io.to(targetSocket).emit('ice_candidate', { sender_id: userId, candidate });
     }
   });
 
-  socket.on('call_reject', ({ caller_id }) => {
-    clearCallSession(userId);
-    if (caller_id) emitToUser(caller_id, 'call_rejected', { receiver_id: userId });
-  });
-
-  socket.on('call_end', async ({ other_id, caller_id, receiver_id, call_type, duration, status, answered_at, started_at }) => {
-    const peerId = other_id || callSessions.get(userId)?.with;
-    if (peerId) {
-      emitToUser(peerId, 'call_ended', { from_id: userId });
+  socket.on('end_call', async ({ target_id, call_id, duration, status }) => {
+    const targetSocket = onlineUsers.get(target_id);
+    if (targetSocket) {
+      io.to(targetSocket).emit('call_ended', { call_id });
     }
-    clearCallSession(userId);
-
-    const now = new Date().toISOString();
-    const callRecord = {
-      caller_id: caller_id || userId,
-      receiver_id: receiver_id || other_id,
-      call_type: call_type || 'audio',
-      status: status || 'completed',
-      duration: duration || 0,
-      started_at: started_at || now,
-      answered_at: answered_at || (status === 'completed' && duration > 0 ? now : null),
-      ended_at: now
-    };
-
-    const { error: callErr } = await supabase.from('call_history').insert(callRecord);
-    if (callErr) addCall(callRecord);
-  });
-
-  socket.on('new_status', (status) => {
-    socket.broadcast.emit('status_update', status);
-  });
-
-  socket.on('status_reaction', ({ status_id, reaction, user }) => {
-    socket.broadcast.emit('status_reaction_update', { status_id, reaction, user });
-  });
-
-  socket.on('disconnect', () => {
-    const session = callSessions.get(userId);
-    if (session?.with) {
-      emitToUser(session.with, 'call_ended', { from_id: userId, reason: 'disconnect' });
-      clearCallSession(userId);
+    if (call_id) {
+      await supabase.from('calls').update({
+        status: status || 'ended',
+        duration: duration || 0,
+        ended_at: new Date().toISOString()
+      }).eq('id', call_id);
     }
-    removeOnlineUser(userId, socket.id);
-    if (!onlineUsers.has(userId)) io.emit('user_offline', { userId });
+  });
+
+  socket.on('decline_call', async ({ caller_id, call_id }) => {
+    const callerSocket = onlineUsers.get(caller_id);
+    if (callerSocket) {
+      io.to(callerSocket).emit('call_declined', { call_id });
+    }
+    if (call_id) {
+      await supabase.from('calls').update({
+        status: 'declined',
+        ended_at: new Date().toISOString()
+      }).eq('id', call_id);
+    }
+  });
+
+  // Status update notification
+  socket.on('new_status', async () => {
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('user_id')
+      .eq('contact_user_id', userId);
+
+    for (const c of (contacts || [])) {
+      const sid = onlineUsers.get(c.user_id);
+      if (sid) {
+        io.to(sid).emit('status_update', { userId });
+      }
+    }
+  });
+
+  socket.on('disconnect', async () => {
+    onlineUsers.delete(userId);
+    await supabase.from('users').update({
+      is_online: false,
+      last_seen: new Date().toISOString()
+    }).eq('id', userId);
+    io.emit('user_offline', { userId });
   });
 });
 
-const PORT = Number(process.env.PORT) || 5000;
-const HOST = process.env.HOST || '0.0.0.0';
-
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(
-      `Port ${PORT} is already in use. On Railway the app starts automatically on deploy — do not run "npm start" again in the shell.`
-    );
-  } else {
-    console.error('Server failed to start:', err.message);
-  }
-  process.exit(1);
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n  HexaChat Backend: ${protocol}://0.0.0.0:${PORT}`);
+  console.log(`  Mobile API:       ${protocol}://101.101.184.2:${PORT}`);
+  console.log(`  Voice endpoint:   ${protocol}://101.101.184.2:${PORT}/api/voice/send\n`);
 });
 
-server.listen(PORT, HOST, () => {
-  const mode = useLocalHttps ? 'local HTTPS' : 'production HTTP';
-  console.log(`HexaChat Backend running (${mode}) on port ${PORT}`);
-  console.log(`Health: /api/health`);
-  if (useLocalHttps) {
-    const { getLanIp } = require('./lib/https-certs');
-    console.log(`LAN: https://${getLanIp()}:${PORT}`);
-  } else if (process.env.RAILWAY_PUBLIC_DOMAIN) {
-    console.log(`Public: https://${process.env.RAILWAY_PUBLIC_DOMAIN}`);
-  }
-  console.log(`CORS allowed: ${allowedOrigins.join(', ')}`);
-});
+module.exports = { io, onlineUsers };

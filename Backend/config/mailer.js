@@ -1,75 +1,40 @@
 const nodemailer = require('nodemailer');
-require('dotenv').config();
 
-const EMAIL_TIMEOUT_MS = 15000;
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD
+  }
+});
 
-function isEmailConfigured() {
-  const user = process.env.GMAIL_USER;
-  const pass = (process.env.GMAIL_PASS || '').replace(/\s/g, '');
-  return !!(user && pass);
+function generateOTP() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-let transporter = null;
-if (isEmailConfigured()) {
-  transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true,
-    auth: {
-      user: process.env.GMAIL_USER,
-      pass: (process.env.GMAIL_PASS || '').replace(/\s/g, '')
-    },
-    connectionTimeout: 10000,
-    greetingTimeout: 10000,
-    socketTimeout: EMAIL_TIMEOUT_MS
-  });
-}
-
-function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
-    })
-  ]);
-}
-
-async function sendOTP(email, otp, purpose = 'verification') {
-  const subject =
-    purpose === 'forgot'
-      ? 'HexaChat - Password Reset OTP'
-      : 'HexaChat - Email Verification OTP';
+async function sendOTPEmail(email, otp, type = 'signup') {
+  const subject = type === 'signup'
+    ? 'HexaChat - Verify Your Email'
+    : 'HexaChat - Reset Your Password';
 
   const html = `
     <div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;padding:32px;background:#000;color:#fff;border-radius:16px;">
       <h1 style="margin:0 0 8px;font-size:28px;font-weight:900;">HexaChat</h1>
-      <p style="color:#aaa;margin:0 0 24px;">Your ${purpose === 'forgot' ? 'password reset' : 'verification'} code</p>
-      <div style="background:#fff;color:#000;font-size:36px;font-weight:900;letter-spacing:8px;text-align:center;padding:20px;border-radius:12px;">${otp}</div>
-      <p style="color:#888;margin-top:24px;font-size:13px;">This code expires in 10 minutes. Do not share it with anyone.</p>
+      <p style="color:#aaa;margin:0 0 24px;">${type === 'signup' ? 'Verify your email to get started' : 'Reset your password'}</p>
+      <div style="background:#111;border:2px solid #fff;border-radius:12px;padding:24px;text-align:center;margin:24px 0;">
+        <p style="color:#888;margin:0 0 8px;font-size:14px;">Your OTP Code</p>
+        <h2 style="margin:0;font-size:36px;letter-spacing:8px;font-weight:900;">${otp}</h2>
+      </div>
+      <p style="color:#666;font-size:13px;">This code expires in 10 minutes. Do not share it with anyone.</p>
     </div>
   `;
 
-  if (!transporter) {
-    console.log(`[HexaChat OTP] ${email} (${purpose}): ${otp}`);
-    return;
-  }
-
-  await withTimeout(
-    transporter.sendMail({
-      from: `"HexaChat" <${process.env.GMAIL_USER}>`,
-      to: email,
-      subject,
-      html
-    }),
-    EMAIL_TIMEOUT_MS,
-    'Email send'
-  );
-}
-
-function sendOTPBackground(email, otp, purpose) {
-  sendOTP(email, otp, purpose).catch((err) => {
-    console.error(`OTP email failed for ${email}:`, err.message || err);
+  await transporter.sendMail({
+    from: `"HexaChat" <${process.env.GMAIL_USER}>`,
+    to: email,
+    subject,
+    html
   });
 }
 
-module.exports = { sendOTP, sendOTPBackground, isEmailConfigured };
+module.exports = { generateOTP, sendOTPEmail };

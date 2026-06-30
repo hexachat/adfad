@@ -1,98 +1,74 @@
-const express = require('express');
 const supabase = require('../config/supabase');
-const { formatUser, USER_PUBLIC_SELECT } = require('../config/user-fields');
-const authMiddleware = require('../middleware/auth');
+const { authMiddleware } = require('../middleware/auth');
 
-const router = express.Router();
+const router = require('express').Router();
 
+// Get all contacts
 router.get('/', authMiddleware, async (req, res) => {
-  try {
-    const { data: contacts } = await supabase
-      .from('contacts')
-      .select('id, contact_id')
-      .eq('user_id', req.user.id);
+  const { data: contacts } = await supabase
+    .from('contacts')
+    .select(`
+      id, created_at,
+      contact:contact_user_id (id, name, phone_number, profile_photo, is_online, last_seen)
+    `)
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false });
 
-    const ids = (contacts || []).map((c) => c.contact_id);
-    if (!ids.length) return res.json({ contacts: [] });
-
-    const { data: users } = await supabase
-      .from('users')
-      .select(USER_PUBLIC_SELECT)
-      .in('id', ids);
-
-    const userMap = Object.fromEntries((users || []).map((u) => [u.id, formatUser(u)]));
-
-    res.json({
-      contacts: (contacts || []).map((c) => ({
-        id: c.id,
-        contact: userMap[c.contact_id] || null
-      }))
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch contacts' });
-  }
+  res.json({ contacts: contacts || [] });
 });
 
+// Add contact by phone number
 router.post('/add', authMiddleware, async (req, res) => {
-  try {
-    const phone = (req.body.phone_number || '').trim();
-    if (!phone) return res.status(400).json({ error: 'Phone number required' });
+  const { phone_number } = req.body;
+  if (!phone_number) return res.status(400).json({ error: 'Phone number required' });
 
-    const { data: contactUser } = await supabase
-      .from('users')
-      .select(USER_PUBLIC_SELECT)
-      .eq('phone', phone)
-      .maybeSingle();
+  const { data: contactUser } = await supabase
+    .from('users')
+    .select('id, name, phone_number, profile_photo, is_online')
+    .eq('phone_number', phone_number)
+    .single();
 
-    if (!contactUser) {
-      return res.status(404).json({ error: 'No user found with this number' });
-    }
+  if (!contactUser) return res.status(404).json({ error: 'No user found with this number' });
+  if (contactUser.id === req.user.id) return res.status(400).json({ error: 'Cannot add yourself' });
 
-    if (contactUser.id === req.user.id) {
-      return res.status(400).json({ error: 'Cannot add yourself' });
-    }
+  const { data: existing } = await supabase
+    .from('contacts')
+    .select('id')
+    .eq('user_id', req.user.id)
+    .eq('contact_user_id', contactUser.id)
+    .single();
 
-    const { data: existing } = await supabase
-      .from('contacts')
-      .select('id')
-      .eq('user_id', req.user.id)
-      .eq('contact_id', contactUser.id)
-      .maybeSingle();
+  if (existing) return res.status(400).json({ error: 'Contact already added' });
 
-    if (existing) {
-      return res.status(400).json({ error: 'Contact already added' });
-    }
+  await supabase.from('contacts').insert({
+    user_id: req.user.id,
+    contact_user_id: contactUser.id
+  });
 
-    const { data: contact, error } = await supabase
-      .from('contacts')
-      .insert({ user_id: req.user.id, contact_id: contactUser.id })
-      .select('id, contact_id')
-      .single();
+  // Mutual contact
+  const { data: reverseExists } = await supabase
+    .from('contacts')
+    .select('id')
+    .eq('user_id', contactUser.id)
+    .eq('contact_user_id', req.user.id)
+    .single();
 
-    if (error) throw error;
-
-    const { data: reverseExists } = await supabase
-      .from('contacts')
-      .select('id')
-      .eq('user_id', contactUser.id)
-      .eq('contact_id', req.user.id)
-      .maybeSingle();
-
-    if (!reverseExists) {
-      await supabase.from('contacts').insert({
-        user_id: contactUser.id,
-        contact_id: req.user.id
-      });
-    }
-
-    res.json({
-      success: true,
-      contact: { ...contact, contact: formatUser(contactUser) }
+  if (!reverseExists) {
+    await supabase.from('contacts').insert({
+      user_id: contactUser.id,
+      contact_user_id: req.user.id
     });
-  } catch (err) {
-    console.error('Add contact error:', err);
-    res.status(500).json({ error: 'Failed to add contact' });
   }
+
+  res.json({ message: 'Contact added', contact: contactUser });
+});
+
+// Delete contact
+router.delete('/:id', authMiddleware, async (req, res) => {
+  await supabase.from('contacts').delete()
+    .eq('id', req.params.id)
+    .eq('user_id', req.user.id);
+  res.json({ message: 'Contact removed' });
 });
 
 module.exports = router;

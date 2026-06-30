@@ -1,74 +1,72 @@
-const express = require('express');
 const supabase = require('../config/supabase');
-const { formatUser, USER_PUBLIC_SELECT } = require('../config/user-fields');
-const { getCallsForUser } = require('../store/call-store');
-const authMiddleware = require('../middleware/auth');
+const { authMiddleware } = require('../middleware/auth');
 
-const router = express.Router();
+const router = require('express').Router();
 
-async function loadCallsFromDb(userId) {
-  const { data: calls, error } = await supabase
-    .from('call_history')
+// Get call history
+router.get('/', authMiddleware, async (req, res) => {
+  const userId = req.user.id;
+
+  const { data: calls } = await supabase
+    .from('calls')
     .select(`
       *,
-      caller:users!call_history_caller_id_fkey(${USER_PUBLIC_SELECT}),
-      receiver:users!call_history_receiver_id_fkey(${USER_PUBLIC_SELECT})
+      caller:users!calls_caller_id_fkey (id, name, phone_number, profile_photo),
+      receiver:users!calls_receiver_id_fkey (id, name, phone_number, profile_photo)
     `)
     .or(`caller_id.eq.${userId},receiver_id.eq.${userId}`)
-    .order('created_at', { ascending: false })
+    .order('started_at', { ascending: false })
     .limit(50);
 
-  if (error) return null;
-  return (calls || []).map((c) => ({
-    ...c,
-    caller: formatUser(c.caller),
-    receiver: formatUser(c.receiver)
-  }));
-}
+  const formatted = (calls || []).map(call => {
+    const isOutgoing = call.caller_id === userId;
+    const other = isOutgoing ? call.receiver : call.caller;
+    return {
+      id: call.id,
+      call_type: call.call_type,
+      status: call.status,
+      started_at: call.started_at,
+      ended_at: call.ended_at,
+      duration: call.duration,
+      direction: isOutgoing ? 'outgoing' : 'incoming',
+      contact: other
+    };
+  });
 
-async function loadCallsFromStore(userId) {
-  const { data: users } = await supabase.from('users').select(USER_PUBLIC_SELECT);
-  const userMap = Object.fromEntries((users || []).map((u) => [u.id, formatUser(u)]));
-
-  return getCallsForUser(userId).map((c) => ({
-    ...c,
-    caller: userMap[c.caller_id] || null,
-    receiver: userMap[c.receiver_id] || null
-  }));
-}
-
-router.get('/', authMiddleware, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    let calls = await loadCallsFromDb(userId);
-    if (calls === null) calls = await loadCallsFromStore(userId);
-    res.json({ calls });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to load call history' });
-  }
+  res.json({ calls: formatted });
 });
 
-router.post('/', authMiddleware, async (req, res) => {
-  try {
-    const { receiver_id, call_type, status, duration } = req.body;
+// Log call
+router.post('/log', authMiddleware, async (req, res) => {
+  const { receiver_id, call_type, status, duration = 0 } = req.body;
 
-    const { data: call, error } = await supabase
-      .from('call_history')
-      .insert({
-        caller_id: req.user.id,
-        receiver_id,
-        call_type: call_type || 'audio',
-        status: status || 'completed',
-        duration: duration || 0
-      })
-      .select()
-      .single();
+  const { data: call } = await supabase
+    .from('calls')
+    .insert({
+      caller_id: req.user.id,
+      receiver_id,
+      call_type: call_type || 'audio',
+      status: status || 'ended',
+      duration,
+      ended_at: new Date().toISOString()
+    })
+    .select('*')
+    .single();
 
-    if (error) throw error;
-    res.json({ success: true, call });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to save call' });
+  res.json({ call });
+});
+
+// Update call status
+router.put('/:callId', authMiddleware, async (req, res) => {
+  const { status, duration } = req.body;
+  const updates = { status };
+  if (duration !== undefined) updates.duration = duration;
+  if (status === 'ended' || status === 'missed' || status === 'declined') {
+    updates.ended_at = new Date().toISOString();
   }
+
+  await supabase.from('calls').update(updates).eq('id', req.params.callId);
+  res.json({ message: 'Call updated' });
 });
 
 module.exports = router;

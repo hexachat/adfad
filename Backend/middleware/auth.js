@@ -1,5 +1,12 @@
 const jwt = require('jsonwebtoken');
-require('dotenv').config();
+
+function generateToken(user) {
+  return jwt.sign(
+    { id: user.id, name: user.name, email: user.email, phone_number: user.phone_number },
+    process.env.JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+}
 
 function authMiddleware(req, res, next) {
   const header = req.headers.authorization;
@@ -7,12 +14,11 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   try {
-    const token = header.split(' ')[1];
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = jwt.verify(header.split(' ')[1], process.env.JWT_SECRET);
     next();
   } catch {
     return res.status(401).json({ error: 'Invalid token' });
   }
 }
 
-module.exports = authMiddleware;
+module.exports = { generateToken, authMiddleware };

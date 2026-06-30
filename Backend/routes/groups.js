@@ -1,70 +1,68 @@
-const express = require('express');
 const supabase = require('../config/supabase');
-const { formatUser, USER_PUBLIC_SELECT } = require('../config/user-fields');
-const authMiddleware = require('../middleware/auth');
+const { authMiddleware } = require('../middleware/auth');
 
-const router = express.Router();
+const router = require('express').Router();
 
-router.get('/', authMiddleware, async (req, res) => {
-  try {
-    const { data: memberships } = await supabase
-      .from('group_members')
-      .select('group_id')
-      .eq('user_id', req.user.id);
+// Create group
+router.post('/create', authMiddleware, async (req, res) => {
+  const { name, member_ids } = req.body;
+  if (!name) return res.status(400).json({ error: 'Group name required' });
 
-    const groupIds = (memberships || []).map((m) => m.group_id);
-    if (!groupIds.length) return res.json({ groups: [] });
+  const { data: group, error } = await supabase
+    .from('groups')
+    .insert({ name, created_by: req.user.id })
+    .select('*')
+    .single();
 
-    const { data: groups } = await supabase
-      .from('groups')
-      .select(`
-        id, name, created_at, created_by,
-        members:group_members(user_id, user:users(${USER_PUBLIC_SELECT}))
-      `)
-      .in('id', groupIds);
+  if (error) return res.status(500).json({ error: 'Failed to create group' });
 
-    const formatted = (groups || []).map((g) => ({
-      ...g,
-      members: (g.members || []).map((m) => ({
-        ...m,
-        user: formatUser(m.user)
-      }))
-    }));
-
-    res.json({ groups: formatted });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch groups' });
+  const members = [{ group_id: group.id, user_id: req.user.id, role: 'admin' }];
+  for (const uid of (member_ids || [])) {
+    if (uid !== req.user.id) {
+      members.push({ group_id: group.id, user_id: uid, role: 'member' });
+    }
   }
+  await supabase.from('group_members').insert(members);
+
+  res.json({ message: 'Group created', group });
 });
 
-router.post('/create', authMiddleware, async (req, res) => {
-  try {
-    const { name, member_ids } = req.body;
-    if (!name) return res.status(400).json({ error: 'Group name required' });
+// Get user's groups
+router.get('/', authMiddleware, async (req, res) => {
+  const { data: memberships } = await supabase
+    .from('group_members')
+    .select(`
+      role,
+      groups (id, name, profile_photo, created_at, created_by)
+    `)
+    .eq('user_id', req.user.id);
 
-    const { data: group, error: groupErr } = await supabase
-      .from('groups')
-      .insert({ name, created_by: req.user.id })
-      .select()
-      .single();
+  res.json({ groups: memberships || [] });
+});
 
-    if (groupErr) throw groupErr;
+// Get group members
+router.get('/:groupId/members', authMiddleware, async (req, res) => {
+  const { data: members } = await supabase
+    .from('group_members')
+    .select(`
+      role,
+      user:users (id, name, phone_number, profile_photo, is_online)
+    `)
+    .eq('group_id', req.params.groupId);
 
-    const members = [req.user.id, ...(member_ids || [])];
-    const uniqueMembers = [...new Set(members)];
+  res.json({ members: members || [] });
+});
 
-    const inserts = uniqueMembers.map((uid) => ({
-      group_id: group.id,
-      user_id: uid
-    }));
+// Add members to group
+router.post('/:groupId/add', authMiddleware, async (req, res) => {
+  const { member_ids } = req.body;
+  const groupId = req.params.groupId;
 
-    await supabase.from('group_members').insert(inserts);
-
-    res.json({ success: true, group: { ...group, member_ids: uniqueMembers } });
-  } catch (err) {
-    console.error('Create group error:', err);
-    res.status(500).json({ error: 'Failed to create group' });
-  }
+  const inserts = (member_ids || []).map(uid => ({
+    group_id: groupId, user_id: uid, role: 'member'
+  }));
+  await supabase.from('group_members').insert(inserts);
+  res.json({ message: 'Members added' });
 });
 
 module.exports = router;

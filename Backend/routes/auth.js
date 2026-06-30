@@ -1,336 +1,260 @@
-const express = require('express');
 const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
 const supabase = require('../config/supabase');
-const { sendOTP, sendOTPBackground } = require('../config/mailer');
-const {
-  formatUser,
-  toDbUser,
-  USER_PRIVATE_SELECT,
-  USER_AUTH_SELECT
-} = require('../config/user-fields');
-const {
-  setPendingSignup,
-  getPendingSignup,
-  deletePendingSignup,
-  setPasswordReset,
-  getPasswordReset,
-  deletePasswordReset
-} = require('../store/otp-store');
-const authMiddleware = require('../middleware/auth');
+const { generateOTP, sendOTPEmail } = require('../config/mailer');
+const { generateToken } = require('../middleware/auth');
 
-const router = express.Router();
+const router = require('express').Router();
 
-function generateOTP() {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-}
-
-function signToken(user) {
-  return jwt.sign(
-    { id: user.id, email: user.email, phone: user.phone || user.phone_number },
-    process.env.JWT_SECRET,
-    { expiresIn: '30d' }
-  );
-}
-
+// Signup - send OTP
 router.post('/signup', async (req, res) => {
   try {
-    const { name, email, password, phone_number } = req.body;
-    if (!name || !email || !password || !phone_number) {
-      return res.status(400).json({ error: 'All fields are required' });
-    }
+    const name = (req.body.name || req.body.fullName || req.body.username || '').trim();
+    const email = (req.body.email || '').trim().toLowerCase();
+    const password = req.body.password || req.body.pass;
+    const phone_number = String(req.body.phone_number || req.body.phone || req.body.number || '').trim();
 
-    const emailLower = email.toLowerCase().trim();
+    if (!name) return res.status(400).json({ error: 'Name is required' });
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+    if (!password) return res.status(400).json({ error: 'Password is required' });
+    if (!phone_number) return res.status(400).json({ error: 'Phone number is required' });
 
-    const { data: existingEmail, error: emailCheckErr } = await supabase
-      .from('users')
-      .select('id')
-      .ilike('email', emailLower)
-      .maybeSingle();
-
-    if (emailCheckErr) {
-      console.error('Signup email check:', emailCheckErr);
-      return res.status(500).json({ error: 'Database error. Please try again.' });
-    }
-
-    if (existingEmail) {
+    const { data: existingEmail } = await supabase
+      .from('users').select('id, email_verified').eq('email', email).single();
+    if (existingEmail && existingEmail.email_verified) {
       return res.status(400).json({ error: 'Email already registered' });
     }
-
-    const { data: existingPhone, error: phoneCheckErr } = await supabase
-      .from('users')
-      .select('id')
-      .eq('phone', phone_number.trim())
-      .maybeSingle();
-
-    if (phoneCheckErr) {
-      console.error('Signup phone check:', phoneCheckErr);
-      return res.status(500).json({ error: 'Database error. Please try again.' });
+    if (existingEmail && !existingEmail.email_verified) {
+      await supabase.from('users').delete().eq('email', email);
     }
 
-    if (existingPhone) {
+    const { data: existingPhone } = await supabase
+      .from('users').select('id, email_verified').eq('phone_number', phone_number).single();
+    if (existingPhone && existingPhone.email_verified) {
       return res.status(400).json({ error: 'Phone number already registered' });
     }
+    if (existingPhone && !existingPhone.email_verified) {
+      await supabase.from('users').delete().eq('phone_number', phone_number);
+    }
 
-    const hashed = await bcrypt.hash(password, 10);
+    const password_hash = await bcrypt.hash(password, 12);
     const otp = generateOTP();
-    const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
-    setPendingSignup(emailLower, {
-      name: name.trim(),
-      email: emailLower,
-      password: hashed,
-      phone_number: phone_number.trim(),
-      otp,
-      otp_expires: expires
+    await supabase.from('otp_codes').delete().eq('email', email).eq('type', 'signup');
+
+    await supabase.from('otp_codes').insert({
+      email, otp, type: 'signup', expires_at,
+      used: false
     });
 
-    res.json({ success: true, message: 'OTP sent to your email', email: emailLower });
-    sendOTPBackground(emailLower, otp, 'signup');
+    // Store pending signup data in otp record metadata via a temp approach
+    // We'll store hashed password temporarily - use a pending_signups approach
+    const { error: insertError } = await supabase.from('users').insert({
+      name, email, password_hash, phone_number,
+      email_verified: false
+    });
+
+    if (insertError) {
+      console.error('User insert error:', insertError);
+      return res.status(500).json({ error: insertError.message || 'Failed to create account. Run supabase_schema.sql first.' });
+    }
+
+    await sendOTPEmail(email, otp, 'signup');
+    res.json({ message: 'OTP sent to your email', email, phone: phone_number, phone_number });
   } catch (err) {
     console.error('Signup error:', err);
-    const msg =
-      err.code === 'EAUTH'
-        ? 'Email service error. Check Gmail app password on the server.'
-        : err.message?.includes('timed out')
-          ? 'Email server is slow. Please try Resend OTP on the next screen.'
-          : 'Signup failed. Please try again.';
-    res.status(500).json({ error: msg });
+    res.status(500).json({ error: 'Signup failed. Please try again.' });
   }
 });
 
-router.post('/verify-signup-otp', async (req, res) => {
+// Verify OTP (signup)
+router.post('/verify-otp', async (req, res) => {
   try {
-    const { email, otp } = req.body;
-    if (!email || !otp) {
-      return res.status(400).json({ error: 'Email and OTP required' });
-    }
+    const { email: rawEmail, otp } = req.body;
+    const email = (rawEmail || '').trim().toLowerCase();
+    if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
 
-    const emailLower = email.toLowerCase().trim();
-    const pending = getPendingSignup(emailLower);
-    if (!pending) {
-      return res.status(400).json({ error: 'No pending signup found' });
-    }
-
-    if (new Date(pending.otp_expires) < new Date()) {
-      return res.status(400).json({ error: 'OTP expired. Please resend.' });
-    }
-
-    if (String(pending.otp) !== String(otp).trim()) {
-      return res.status(400).json({ error: 'OTP incorrect', incorrect: true });
-    }
-
-    const { data: user, error: userErr } = await supabase
-      .from('users')
-      .insert(
-        toDbUser({
-          name: pending.name,
-          email: pending.email,
-          password_hash: pending.password,
-          phone_number: pending.phone_number,
-          avatar_url: null,
-          is_verified: true
-        })
-      )
-      .select(USER_PRIVATE_SELECT)
+    const { data: otpRecord } = await supabase
+      .from('otp_codes')
+      .select('*')
+      .eq('email', email)
+      .eq('type', 'signup')
+      .eq('used', false)
+      .order('created_at', { ascending: false })
+      .limit(1)
       .single();
 
-    if (userErr) throw userErr;
+    if (!otpRecord) return res.status(400).json({ error: 'No OTP found. Please request a new one.' });
+    if (new Date(otpRecord.expires_at) < new Date()) {
+      return res.status(400).json({ error: 'OTP expired. Please resend.' });
+    }
+    if (otpRecord.otp !== otp) {
+      return res.status(400).json({ error: 'OTP incorrect' });
+    }
 
-    deletePendingSignup(emailLower);
+    await supabase.from('otp_codes').update({ used: true }).eq('id', otpRecord.id);
+    await supabase.from('users').update({ email_verified: true }).eq('email', email);
 
-    const formatted = formatUser(user, true);
-    const token = signToken(user);
-    res.json({ success: true, token, user: formatted });
+    const { data: user } = await supabase.from('users').select('*').eq('email', email).single();
+    const token = generateToken(user);
+
+    res.json({
+      message: 'Email verified successfully',
+      token,
+      user: {
+        id: user.id, name: user.name, email: user.email,
+        phone_number: user.phone_number, profile_photo: user.profile_photo
+      }
+    });
   } catch (err) {
     console.error('Verify OTP error:', err);
-    res.status(500).json({ error: err.message || 'Verification failed' });
+    res.status(500).json({ error: 'Verification failed' });
   }
 });
 
-router.post('/resend-signup-otp', async (req, res) => {
+// Resend OTP
+router.post('/resend-otp', async (req, res) => {
   try {
-    const emailLower = (req.body.email || '').toLowerCase().trim();
-    const pending = getPendingSignup(emailLower);
-
-    if (!pending) {
-      return res.status(400).json({ error: 'No pending signup found' });
-    }
+    const { email, type = 'signup' } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
 
     const otp = generateOTP();
-    const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
-    setPendingSignup(emailLower, { ...pending, otp, otp_expires: expires });
-    res.json({ success: true, message: 'OTP resent successfully' });
-    sendOTPBackground(emailLower, otp, 'signup');
+    await supabase.from('otp_codes').delete().eq('email', email).eq('type', type);
+    await supabase.from('otp_codes').insert({ email, otp, type, expires_at, used: false });
+    await sendOTPEmail(email, otp, type);
+
+    res.json({ message: 'OTP resent successfully' });
   } catch (err) {
     console.error('Resend OTP error:', err);
     res.status(500).json({ error: 'Failed to resend OTP' });
   }
 });
 
+// Login
 router.post('/login', async (req, res) => {
   try {
-    const email = (req.body.email || '').toLowerCase().trim();
-    const { password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password required' });
-    }
+    const email = (req.body.email || '').trim().toLowerCase();
+    const password = req.body.password;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-    const { data: user, error } = await supabase
+    const { data: user, error: dbError } = await supabase
       .from('users')
-      .select(USER_AUTH_SELECT)
-      .ilike('email', email)
+      .select('*')
+      .eq('email', email)
       .maybeSingle();
 
-    if (error) {
-      console.error('Login lookup error:', error);
-      return res.status(500).json({ error: 'Login failed' });
+    if (dbError) {
+      console.error('Login db error:', dbError);
+      return res.status(500).json({ error: 'Database error. Check Supabase connection.' });
     }
-
-    if (!user || !user.password_hash) {
-      return res.status(401).json({ error: 'Invalid email or password' });
-    }
+    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+    if (!user.email_verified) return res.status(401).json({ error: 'Please verify your email first. Check OTP page.' });
 
     const valid = await bcrypt.compare(password, user.password_hash);
-    if (!valid) {
-      return res.status(401).json({ error: 'Invalid email or password' });
-    }
+    if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
 
-    const token = signToken(user);
-    res.json({ success: true, token, user: formatUser(user, true) });
+    const token = generateToken(user);
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user.id, name: user.name, email: user.email,
+        phone_number: user.phone_number, profile_photo: user.profile_photo
+      }
+    });
   } catch (err) {
     console.error('Login error:', err);
-    res.status(500).json({ error: err.message || 'Login failed' });
+    res.status(500).json({ error: 'Login failed. Please try again.' });
   }
 });
 
+// Forgot password - send OTP
 router.post('/forgot-password', async (req, res) => {
   try {
-    const emailLower = (req.body.email || '').toLowerCase().trim();
-    if (!emailLower) return res.status(400).json({ error: 'Email required' });
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
 
-    const { data: user } = await supabase
-      .from('users')
-      .select('id')
-      .ilike('email', emailLower)
-      .maybeSingle();
-
-    if (!user) {
-      return res.status(404).json({ error: 'No account found with this email' });
-    }
+    const { data: user } = await supabase.from('users').select('id').eq('email', email).single();
+    if (!user) return res.status(404).json({ error: 'No account found with this email' });
 
     const otp = generateOTP();
-    const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
-    setPasswordReset(emailLower, { otp, otp_expires: expires, verified: false });
-    res.json({ success: true, message: 'OTP sent to your email' });
-    sendOTPBackground(emailLower, otp, 'forgot');
+    await supabase.from('otp_codes').delete().eq('email', email).eq('type', 'forgot_password');
+    await supabase.from('otp_codes').insert({
+      email, otp, type: 'forgot_password', expires_at, used: false
+    });
+    await sendOTPEmail(email, otp, 'forgot_password');
+
+    res.json({ message: 'OTP sent to your email' });
   } catch (err) {
     console.error('Forgot password error:', err);
-    res.status(500).json({ error: 'Failed to send OTP' });
+    res.status(500).json({ error: 'Failed to send reset OTP' });
   }
 });
 
-router.post('/verify-forgot-otp', async (req, res) => {
+// Verify forgot password OTP
+router.post('/verify-reset-otp', async (req, res) => {
   try {
-    const emailLower = (req.body.email || '').toLowerCase().trim();
-    const otp = String(req.body.otp || '').trim();
-    const reset = getPasswordReset(emailLower);
+    const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({ error: 'Email and OTP required' });
 
-    if (!reset) return res.status(400).json({ error: 'No reset request found' });
-    if (new Date(reset.otp_expires) < new Date()) {
+    const { data: otpRecord } = await supabase
+      .from('otp_codes')
+      .select('*')
+      .eq('email', email)
+      .eq('type', 'forgot_password')
+      .eq('used', false)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (!otpRecord) return res.status(400).json({ error: 'No OTP found' });
+    if (new Date(otpRecord.expires_at) < new Date()) {
       return res.status(400).json({ error: 'OTP expired' });
     }
-    if (String(reset.otp) !== otp) {
-      return res.status(400).json({ error: 'OTP incorrect', incorrect: true });
+    if (otpRecord.otp !== otp) {
+      return res.status(400).json({ error: 'OTP incorrect' });
     }
 
-    setPasswordReset(emailLower, { ...reset, verified: true });
-    res.json({ success: true, message: 'OTP verified. Enter new password.' });
+    res.json({ message: 'OTP verified', resetToken: otpRecord.id });
   } catch (err) {
     res.status(500).json({ error: 'Verification failed' });
   }
 });
 
+// Reset password
 router.post('/reset-password', async (req, res) => {
   try {
-    const emailLower = (req.body.email || '').toLowerCase().trim();
-    const otp = String(req.body.otp || '').trim();
-    const { newPassword } = req.body;
-
-    if (!newPassword || newPassword.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    const { email, otp, new_password } = req.body;
+    if (!email || !otp || !new_password) {
+      return res.status(400).json({ error: 'All fields required' });
     }
 
-    const reset = getPasswordReset(emailLower);
-    if (!reset || !reset.verified || String(reset.otp) !== otp) {
-      return res.status(400).json({ error: 'Invalid or unverified reset request' });
-    }
-
-    const hashed = await bcrypt.hash(newPassword, 10);
-    const { data: updated, error: updateErr } = await supabase
-      .from('users')
-      .update({ password_hash: hashed })
-      .ilike('email', emailLower)
-      .select('id, email')
-      .maybeSingle();
-
-    if (updateErr) {
-      console.error('Reset password DB error:', updateErr);
-      return res.status(500).json({ error: 'Failed to update password in database' });
-    }
-
-    if (!updated) {
-      return res.status(404).json({ error: 'User account not found' });
-    }
-
-    deletePasswordReset(emailLower);
-    res.json({ success: true, message: 'Password updated successfully' });
-  } catch (err) {
-    console.error('Reset password error:', err);
-    res.status(500).json({ error: 'Failed to reset password' });
-  }
-});
-
-router.post('/resend-forgot-otp', async (req, res) => {
-  try {
-    const emailLower = (req.body.email || '').toLowerCase().trim();
-
-    const { data: user } = await supabase
-      .from('users')
-      .select('id')
-      .ilike('email', emailLower)
-      .maybeSingle();
-
-    if (!user) return res.status(404).json({ error: 'No account found' });
-
-    const otp = generateOTP();
-    const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-    setPasswordReset(emailLower, { otp, otp_expires: expires, verified: false });
-    res.json({ success: true, message: 'OTP resent' });
-    sendOTPBackground(emailLower, otp, 'forgot');
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to resend OTP' });
-  }
-});
-
-router.get('/me', authMiddleware, async (req, res) => {
-  try {
-    const { data: user, error } = await supabase
-      .from('users')
-      .select(USER_PRIVATE_SELECT)
-      .eq('id', req.user.id)
+    const { data: otpRecord } = await supabase
+      .from('otp_codes')
+      .select('*')
+      .eq('email', email)
+      .eq('type', 'forgot_password')
+      .eq('otp', otp)
+      .eq('used', false)
       .single();
 
-    if (error || !user) {
-      return res.status(404).json({ error: 'User not found' });
+    if (!otpRecord) return res.status(400).json({ error: 'Invalid OTP' });
+    if (new Date(otpRecord.expires_at) < new Date()) {
+      return res.status(400).json({ error: 'OTP expired' });
     }
 
-    res.json({ user: formatUser(user, true) });
+    const password_hash = await bcrypt.hash(new_password, 12);
+    await supabase.from('users').update({ password_hash }).eq('email', email);
+    await supabase.from('otp_codes').update({ used: true }).eq('id', otpRecord.id);
+
+    res.json({ message: 'Password reset successfully' });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch profile' });
+    console.error('Reset password error:', err);
+    res.status(500).json({ error: 'Password reset failed' });
   }
 });
 
