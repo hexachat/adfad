@@ -2,7 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const supabase = require('../config/supabase');
-const { sendOTP } = require('../config/mailer');
+const { sendOTP, sendOTPBackground } = require('../config/mailer');
 const {
   formatUser,
   toDbUser,
@@ -42,21 +42,31 @@ router.post('/signup', async (req, res) => {
 
     const emailLower = email.toLowerCase().trim();
 
-    const { data: existingEmail } = await supabase
+    const { data: existingEmail, error: emailCheckErr } = await supabase
       .from('users')
       .select('id')
       .ilike('email', emailLower)
       .maybeSingle();
 
+    if (emailCheckErr) {
+      console.error('Signup email check:', emailCheckErr);
+      return res.status(500).json({ error: 'Database error. Please try again.' });
+    }
+
     if (existingEmail) {
       return res.status(400).json({ error: 'Email already registered' });
     }
 
-    const { data: existingPhone } = await supabase
+    const { data: existingPhone, error: phoneCheckErr } = await supabase
       .from('users')
       .select('id')
       .eq('phone', phone_number.trim())
       .maybeSingle();
+
+    if (phoneCheckErr) {
+      console.error('Signup phone check:', phoneCheckErr);
+      return res.status(500).json({ error: 'Database error. Please try again.' });
+    }
 
     if (existingPhone) {
       return res.status(400).json({ error: 'Phone number already registered' });
@@ -75,13 +85,16 @@ router.post('/signup', async (req, res) => {
       otp_expires: expires
     });
 
-    await sendOTP(emailLower, otp, 'signup');
     res.json({ success: true, message: 'OTP sent to your email', email: emailLower });
+    sendOTPBackground(emailLower, otp, 'signup');
   } catch (err) {
     console.error('Signup error:', err);
-    const msg = err.code === 'EAUTH'
-      ? 'Email service error. Check Gmail app password in Backend/.env'
-      : 'Signup failed. Please try again.';
+    const msg =
+      err.code === 'EAUTH'
+        ? 'Email service error. Check Gmail app password on the server.'
+        : err.message?.includes('timed out')
+          ? 'Email server is slow. Please try Resend OTP on the next screen.'
+          : 'Signup failed. Please try again.';
     res.status(500).json({ error: msg });
   }
 });
@@ -148,8 +161,8 @@ router.post('/resend-signup-otp', async (req, res) => {
     const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     setPendingSignup(emailLower, { ...pending, otp, otp_expires: expires });
-    await sendOTP(emailLower, otp, 'signup');
     res.json({ success: true, message: 'OTP resent successfully' });
+    sendOTPBackground(emailLower, otp, 'signup');
   } catch (err) {
     console.error('Resend OTP error:', err);
     res.status(500).json({ error: 'Failed to resend OTP' });
@@ -211,8 +224,8 @@ router.post('/forgot-password', async (req, res) => {
     const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     setPasswordReset(emailLower, { otp, otp_expires: expires, verified: false });
-    await sendOTP(emailLower, otp, 'forgot');
     res.json({ success: true, message: 'OTP sent to your email' });
+    sendOTPBackground(emailLower, otp, 'forgot');
   } catch (err) {
     console.error('Forgot password error:', err);
     res.status(500).json({ error: 'Failed to send OTP' });
@@ -296,8 +309,8 @@ router.post('/resend-forgot-otp', async (req, res) => {
     const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     setPasswordReset(emailLower, { otp, otp_expires: expires, verified: false });
-    await sendOTP(emailLower, otp, 'forgot');
     res.json({ success: true, message: 'OTP resent' });
+    sendOTPBackground(emailLower, otp, 'forgot');
   } catch (err) {
     res.status(500).json({ error: 'Failed to resend OTP' });
   }

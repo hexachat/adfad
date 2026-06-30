@@ -22,13 +22,19 @@ const callRoutes = require('./routes/calls');
 const { getIceServerConfig, getIceServerConfigSync } = require('./lib/webrtc-ice');
 
 function getAllowedOrigins() {
-  const raw =
-    process.env.FRONTEND_URL ||
-    'https://hexachat2.netlify.app,http://localhost:3000,https://localhost:3000,http://127.0.0.1:3000';
-  return raw
+  const defaults = [
+    'https://hexachat2.netlify.app',
+    'http://localhost:3000',
+    'https://localhost:3000',
+    'http://127.0.0.1:3000',
+    'https://127.0.0.1:3000'
+  ];
+  const raw = process.env.FRONTEND_URL || defaults.join(',');
+  const fromEnv = raw
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+  return [...new Set([...defaults, ...fromEnv])];
 }
 
 const allowedOrigins = getAllowedOrigins();
@@ -36,9 +42,17 @@ const allowedOrigins = getAllowedOrigins();
 function corsOrigin(origin, callback) {
   if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
     callback(null, true);
-  } else {
-    callback(null, allowedOrigins[0]);
+    return;
   }
+  if (
+    /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|101\.101\.\d{1,3}\.\d{1,3})(:\d+)?$/.test(
+      origin
+    )
+  ) {
+    callback(null, true);
+    return;
+  }
+  callback(null, allowedOrigins[0]);
 }
 
 const app = express();
@@ -131,6 +145,7 @@ app.get('/api/network', (_, res) => {
 });
 
 const onlineUsers = new Map();
+const callSessions = new Map();
 
 function addOnlineUser(userId, socketId) {
   if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
@@ -150,6 +165,18 @@ function emitToUser(userId, event, data) {
   for (const sid of sockets) {
     io.to(sid).emit(event, data);
   }
+}
+
+function clearCallSession(userId) {
+  const session = callSessions.get(userId);
+  if (!session) return;
+  callSessions.delete(userId);
+  callSessions.delete(session.with);
+}
+
+function setCallSession(userA, userB) {
+  callSessions.set(userA, { with: userB });
+  callSessions.set(userB, { with: userA });
 }
 
 io.use((socket, next) => {
@@ -242,24 +269,54 @@ io.on('connection', (socket) => {
   });
 
   socket.on('call_user', async ({ receiver_id, call_type, offer }) => {
-    const caller = await fetchUserById(supabase, userId);
-    const receiverSockets = onlineUsers.get(receiver_id);
+    try {
+      if (!receiver_id || receiver_id === userId || !offer?.sdp) {
+        socket.emit('call_unavailable', { receiver_id });
+        return;
+      }
 
-    if (receiverSockets && receiverSockets.size) {
+      if (callSessions.has(userId)) {
+        socket.emit('call_busy', { receiver_id });
+        return;
+      }
+      if (callSessions.has(receiver_id)) {
+        socket.emit('call_busy', { receiver_id });
+        return;
+      }
+
+      const receiverSockets = onlineUsers.get(receiver_id);
+      if (!receiverSockets || !receiverSockets.size) {
+        socket.emit('call_unavailable', { receiver_id });
+        return;
+      }
+
+      const caller = await fetchUserById(supabase, userId);
+      setCallSession(userId, receiver_id);
+
       emitToUser(receiver_id, 'incoming_call', {
         caller,
-        call_type,
+        call_type: call_type || 'audio',
         offer,
         caller_id: userId
       });
       socket.emit('call_ringing', { receiver_id });
-    } else {
+    } catch (err) {
+      console.error('call_user error:', err);
+      clearCallSession(userId);
       socket.emit('call_unavailable', { receiver_id });
     }
   });
 
   socket.on('call_answer', ({ caller_id, answer }) => {
+    if (!caller_id || !answer?.sdp) return;
     emitToUser(caller_id, 'call_answered', { answer, receiver_id: userId });
+  });
+
+  socket.on('call_busy', ({ caller_id }) => {
+    if (caller_id) {
+      clearCallSession(caller_id);
+      emitToUser(caller_id, 'call_busy', { receiver_id: userId });
+    }
   });
 
   socket.on('ice_candidate', ({ target_id, candidate }) => {
@@ -269,11 +326,16 @@ io.on('connection', (socket) => {
   });
 
   socket.on('call_reject', ({ caller_id }) => {
-    emitToUser(caller_id, 'call_rejected', { receiver_id: userId });
+    clearCallSession(userId);
+    if (caller_id) emitToUser(caller_id, 'call_rejected', { receiver_id: userId });
   });
 
-  socket.on('call_end', async ({ other_id, caller_id, receiver_id, call_type, duration, status, answered_at }) => {
-    emitToUser(other_id, 'call_ended', { from_id: userId });
+  socket.on('call_end', async ({ other_id, caller_id, receiver_id, call_type, duration, status, answered_at, started_at }) => {
+    const peerId = other_id || callSessions.get(userId)?.with;
+    if (peerId) {
+      emitToUser(peerId, 'call_ended', { from_id: userId });
+    }
+    clearCallSession(userId);
 
     const now = new Date().toISOString();
     const callRecord = {
@@ -282,7 +344,7 @@ io.on('connection', (socket) => {
       call_type: call_type || 'audio',
       status: status || 'completed',
       duration: duration || 0,
-      started_at: now,
+      started_at: started_at || now,
       answered_at: answered_at || (status === 'completed' && duration > 0 ? now : null),
       ended_at: now
     };
@@ -300,6 +362,11 @@ io.on('connection', (socket) => {
   });
 
   socket.on('disconnect', () => {
+    const session = callSessions.get(userId);
+    if (session?.with) {
+      emitToUser(session.with, 'call_ended', { from_id: userId, reason: 'disconnect' });
+      clearCallSession(userId);
+    }
     removeOnlineUser(userId, socket.id);
     if (!onlineUsers.has(userId)) io.emit('user_offline', { userId });
   });

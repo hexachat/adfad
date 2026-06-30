@@ -1,13 +1,38 @@
 const nodemailer = require('nodemailer');
 require('dotenv').config();
 
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_PASS.replace(/\s/g, '')
-  }
-});
+const EMAIL_TIMEOUT_MS = 15000;
+
+function isEmailConfigured() {
+  const user = process.env.GMAIL_USER;
+  const pass = (process.env.GMAIL_PASS || '').replace(/\s/g, '');
+  return !!(user && pass);
+}
+
+let transporter = null;
+if (isEmailConfigured()) {
+  transporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    auth: {
+      user: process.env.GMAIL_USER,
+      pass: (process.env.GMAIL_PASS || '').replace(/\s/g, '')
+    },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: EMAIL_TIMEOUT_MS
+  });
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+    })
+  ]);
+}
 
 async function sendOTP(email, otp, purpose = 'verification') {
   const subject =
@@ -24,12 +49,27 @@ async function sendOTP(email, otp, purpose = 'verification') {
     </div>
   `;
 
-  await transporter.sendMail({
-    from: `"HexaChat" <${process.env.GMAIL_USER}>`,
-    to: email,
-    subject,
-    html
+  if (!transporter) {
+    console.log(`[HexaChat OTP] ${email} (${purpose}): ${otp}`);
+    return;
+  }
+
+  await withTimeout(
+    transporter.sendMail({
+      from: `"HexaChat" <${process.env.GMAIL_USER}>`,
+      to: email,
+      subject,
+      html
+    }),
+    EMAIL_TIMEOUT_MS,
+    'Email send'
+  );
+}
+
+function sendOTPBackground(email, otp, purpose) {
+  sendOTP(email, otp, purpose).catch((err) => {
+    console.error(`OTP email failed for ${email}:`, err.message || err);
   });
 }
 
-module.exports = { sendOTP };
+module.exports = { sendOTP, sendOTPBackground, isEmailConfigured };
