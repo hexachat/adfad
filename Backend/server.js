@@ -210,14 +210,34 @@ io.on('connection', async (socket) => {
     }
   });
 
-  socket.on('answer_call', ({ caller_id, call_id, answer }) => {
+  socket.on('answer_call', ({ caller_id, call_id }) => {
     const callerSocket = onlineUsers.get(caller_id);
     if (callerSocket) {
       io.to(callerSocket).emit('call_answered', {
         answerer_id: userId,
-        call_id,
+        call_id
+      });
+    }
+  });
+
+  socket.on('call_offer', ({ target_id, offer, call_id }) => {
+    const targetSocket = onlineUsers.get(target_id);
+    if (targetSocket) {
+      io.to(targetSocket).emit('call_offer', {
+        sender_id: userId,
+        offer,
+        call_id
+      });
+    }
+  });
+
+  socket.on('call_answer_sdp', ({ target_id, answer, call_id }) => {
+    const targetSocket = onlineUsers.get(target_id);
+    if (targetSocket) {
+      io.to(targetSocket).emit('call_answer_sdp', {
+        sender_id: userId,
         answer,
-        answerer_socket: socket.id
+        call_id
       });
     }
   });
