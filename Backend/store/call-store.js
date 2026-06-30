@@ -22,23 +22,31 @@ function save(calls) {
 
 function addCall(record) {
   const calls = load();
+  const now = new Date().toISOString();
   const entry = {
     id: uuidv4(),
-    created_at: new Date().toISOString(),
+    created_at: now,
+    started_at: record.started_at || now,
+    answered_at: record.answered_at || null,
+    ended_at: record.ended_at || now,
     duration: 0,
     status: 'completed',
     call_type: 'audio',
     ...record
   };
   calls.unshift(entry);
-  save(calls.slice(0, 200));
+  save(calls.slice(0, 500));
   return entry;
 }
 
 function getCallsForUser(userId) {
   return load()
     .filter((c) => c.caller_id === userId || c.receiver_id === userId)
-    .slice(0, 50);
+    .slice(0, 100);
 }
 
-module.exports = { addCall, getCallsForUser };
+function clearAllCalls() {
+  save([]);
+}
+
+module.exports = { addCall, getCallsForUser, clearAllCalls };

@@ -272,15 +272,19 @@ io.on('connection', (socket) => {
     emitToUser(caller_id, 'call_rejected', { receiver_id: userId });
   });
 
-  socket.on('call_end', async ({ other_id, call_type, duration, status }) => {
+  socket.on('call_end', async ({ other_id, caller_id, receiver_id, call_type, duration, status, answered_at }) => {
     emitToUser(other_id, 'call_ended', { from_id: userId });
 
+    const now = new Date().toISOString();
     const callRecord = {
-      caller_id: userId,
-      receiver_id: other_id,
+      caller_id: caller_id || userId,
+      receiver_id: receiver_id || other_id,
       call_type: call_type || 'audio',
       status: status || 'completed',
-      duration: duration || 0
+      duration: duration || 0,
+      started_at: now,
+      answered_at: answered_at || (status === 'completed' && duration > 0 ? now : null),
+      ended_at: now
     };
 
     const { error: callErr } = await supabase.from('call_history').insert(callRecord);

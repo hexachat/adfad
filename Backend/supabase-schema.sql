@@ -68,11 +68,18 @@ CREATE TABLE IF NOT EXISTS call_history (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   caller_id UUID REFERENCES users(id) ON DELETE CASCADE,
   receiver_id UUID REFERENCES users(id) ON DELETE CASCADE,
-  call_type TEXT DEFAULT 'audio',
-  status TEXT DEFAULT 'completed',
+  call_type TEXT DEFAULT 'audio' CHECK (call_type IN ('audio', 'video')),
+  status TEXT DEFAULT 'completed' CHECK (status IN ('completed', 'missed', 'rejected', 'failed', 'busy')),
   duration INTEGER DEFAULT 0,
+  started_at TIMESTAMPTZ DEFAULT NOW(),
+  answered_at TIMESTAMPTZ,
+  ended_at TIMESTAMPTZ DEFAULT NOW(),
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE INDEX IF NOT EXISTS idx_call_history_caller ON call_history(caller_id);
+CREATE INDEX IF NOT EXISTS idx_call_history_receiver ON call_history(receiver_id);
+CREATE INDEX IF NOT EXISTS idx_call_history_created ON call_history(created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id);
