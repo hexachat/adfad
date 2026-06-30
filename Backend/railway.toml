@@ -1,0 +1,14 @@
+[build]
+builder = "NIXPACKS"
+buildCommand = "npm install"
+
+[deploy]
+startCommand = "node server.js"
+healthcheckPath = "/api/health"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"
+
+# Railway dashboard settings (when Backend folder is uploaded as repo root):
+# Root Directory = leave EMPTY (not "Backend")
+# Custom Build Command = npm install  (or leave empty)
+# Custom Start Command = node server.js  (or leave empty — this file sets it)

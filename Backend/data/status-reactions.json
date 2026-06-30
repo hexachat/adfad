@@ -1,0 +1,26 @@
+{
+  "a4b62e90-922f-4f03-bb8e-94c41b679032": [
+    {
+      "id": "86130ab4-20a4-4587-837b-2c653d72011c",
+      "user_id": "8e01ce01-e3be-48c4-aeac-f478f2496b66",
+      "reaction": "👏",
+      "reacted_at": "2026-06-30T06:42:22.341Z"
+    }
+  ],
+  "9aec20de-56c5-42be-8b63-c8662478bafb": [
+    {
+      "id": "61bee9ab-14b7-42b9-8101-9e4637ca9907",
+      "user_id": "3929d1bf-c085-4cb1-bf8d-32576a4aca76",
+      "reaction": "😮",
+      "reacted_at": "2026-06-30T07:06:53.596Z"
+    }
+  ],
+  "122d7560-935a-4be0-9fc2-08f087df7b3c": [
+    {
+      "id": "1e12746a-fe21-4d7d-bc66-b2acb63f5a84",
+      "user_id": "3929d1bf-c085-4cb1-bf8d-32576a4aca76",
+      "reaction": "🔥",
+      "reacted_at": "2026-06-30T07:07:35.878Z"
+    }
+  ]
+}

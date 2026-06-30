@@ -1,0 +1,45 @@
+{
+  "pendingSignups": {
+    "test_1782761690454@hexachat.test": {
+      "name": "Test",
+      "email": "test_1782761690454@hexachat.test",
+      "password": "hash",
+      "phone_number": "+1112223334",
+      "otp": "123456",
+      "otp_expires": "2026-06-29T19:44:50.454Z"
+    },
+    "newtest1782762137412@mail.test": {
+      "name": "T",
+      "email": "newtest1782762137412@mail.test",
+      "password": "$2a$10$BPUOHx24CXg9e9EmIXRlmedqx/MkQHaRKJb.6lXxn0Ypy7Wkq16hy",
+      "phone_number": "+88862137412",
+      "otp": "654321",
+      "otp_expires": "2026-06-29T19:52:17.607Z"
+    },
+    "poweredbyhexscopee@gmail.com": {
+      "name": "Not for use",
+      "email": "poweredbyhexscopee@gmail.com",
+      "password": "$2a$10$g8KfXMen7iESQhq7cyZ3BOuNyKA3xZtpDHGcBEPxSKtMSHPyqLSD.",
+      "phone_number": "+3478068569",
+      "otp": "590455",
+      "otp_expires": "2026-06-29T19:54:49.202Z"
+    },
+    "testuser888@test.com": {
+      "name": "Test User3",
+      "email": "testuser888@test.com",
+      "password": "$2a$10$HpfzOp77gTDVrDvYPR1iyuK8WSjJSoQhBCWuMXupky3RH2eL3atMm",
+      "phone_number": "+9998887773",
+      "otp": "951141",
+      "otp_expires": "2026-06-29T19:55:02.187Z"
+    },
+    "knowledgeislmaic8@gmail.com": {
+      "name": "HexScopee",
+      "email": "knowledgeislmaic8@gmail.com",
+      "password": "$2a$10$VsSzkj5U2biqnSeiUQK.BuDNEquQt359A7BPHBu5JsPsKny5SMqnO",
+      "phone_number": "+923478068974",
+      "otp": "459710",
+      "otp_expires": "2026-06-30T03:03:13.885Z"
+    }
+  },
+  "passwordResets": {}
+}

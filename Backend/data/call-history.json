@@ -1,0 +1,56 @@
+[
+  {
+    "id": "90c3daeb-733f-4c84-a3ba-5ce768735987",
+    "created_at": "2026-06-30T06:56:00.685Z",
+    "duration": 0,
+    "status": "completed",
+    "call_type": "audio",
+    "caller_id": "8e01ce01-e3be-48c4-aeac-f478f2496b66",
+    "receiver_id": "30099ce0-2a8e-4bfa-af4b-85acddc9a4e9"
+  },
+  {
+    "id": "a44da6a7-fe96-4dbd-8434-8cb4432089ba",
+    "created_at": "2026-06-30T04:03:59.432Z",
+    "duration": 0,
+    "status": "completed",
+    "call_type": "video",
+    "caller_id": "3929d1bf-c085-4cb1-bf8d-32576a4aca76",
+    "receiver_id": "8e01ce01-e3be-48c4-aeac-f478f2496b66"
+  },
+  {
+    "id": "d1066358-a54e-48f1-9b9d-46fd5eaa8074",
+    "created_at": "2026-06-30T02:49:29.434Z",
+    "duration": 0,
+    "status": "failed",
+    "call_type": "audio",
+    "caller_id": "de022881-da5d-44d5-ae58-483eea79f738",
+    "receiver_id": "13c1b94c-3d65-45d0-aed5-d3eb492af680"
+  },
+  {
+    "id": "3c926032-1e87-4a2b-8053-23d65082ef03",
+    "created_at": "2026-06-30T02:49:27.097Z",
+    "duration": 0,
+    "status": "failed",
+    "call_type": "audio",
+    "caller_id": "de022881-da5d-44d5-ae58-483eea79f738",
+    "receiver_id": "13c1b94c-3d65-45d0-aed5-d3eb492af680"
+  },
+  {
+    "id": "9e2ed37b-4dac-4bbf-9a84-685ac0b1ecf7",
+    "created_at": "2026-06-30T02:49:26.030Z",
+    "duration": 0,
+    "status": "failed",
+    "call_type": "audio",
+    "caller_id": "de022881-da5d-44d5-ae58-483eea79f738",
+    "receiver_id": "13c1b94c-3d65-45d0-aed5-d3eb492af680"
+  },
+  {
+    "id": "3b306c80-1f5a-48b4-9885-f7e008fb2ce1",
+    "created_at": "2026-06-30T02:49:25.962Z",
+    "duration": 0,
+    "status": "failed",
+    "call_type": "audio",
+    "caller_id": "de022881-da5d-44d5-ae58-483eea79f738",
+    "receiver_id": "13c1b94c-3d65-45d0-aed5-d3eb492af680"
+  }
+]
