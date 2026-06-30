@@ -3,9 +3,12 @@ const express = require('express');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const supabase = require('./config/supabase');
-const { createServer } = require('./config/https');
+const http = require('http');
+const { loadHttpsOptions } = require('./config/https');
+const { getLanIp } = require('./utils/lanIp');
 
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/users');
@@ -16,24 +19,51 @@ const statusRoutes = require('./routes/statuses');
 const callRoutes = require('./routes/calls');
 const voiceRoutes = require('./routes/voice');
 
+const isProduction = !!(process.env.RAILWAY_ENVIRONMENT || process.env.NODE_ENV === 'production');
+const PORT = Number(process.env.PORT) || 5000;
+
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  'https://hexachat.netlify.app',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000'
+].filter(Boolean);
+
+if (process.env.ALLOWED_ORIGINS) {
+  allowedOrigins.push(...process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean));
+}
+
+function corsOrigin(origin, callback) {
+  if (!origin) return callback(null, true);
+  if (allowedOrigins.includes(origin)) return callback(null, true);
+  if (/\.netlify\.app$/i.test(origin)) return callback(null, true);
+  if (!isProduction) return callback(null, true);
+  callback(null, true);
+}
+
 const app = express();
-const { server, protocol } = createServer(app);
+app.set('trust proxy', 1);
 
-// Share io with routes
-app.set('io', null);
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
-const io = new Server(server, {
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
+    origin: corsOrigin,
+    methods: ['GET', 'POST'],
+    credentials: true
   }
 });
-
 app.set('io', io);
 
-app.use(cors({ origin: '*' }));
+app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/uploads', express.static(uploadsDir));
+
+app.get('/', (req, res) => {
+  res.json({ app: 'HexaChat API', status: 'running', health: '/api/health' });
+});
 
 app.use('/api/auth', authRoutes);
 app.use('/api/users', userRoutes);
@@ -50,13 +80,14 @@ app.get('/api/health', async (req, res) => {
     status: 'ok',
     app: 'HexaChat',
     version: '25',
+    env: isProduction ? 'production' : 'development',
     database: error ? 'error' : 'connected',
     dbError: error?.message || null
   });
 });
 
 // Socket.io online users map
-const onlineUsers = new Map(); // userId -> socketId
+const onlineUsers = new Map();
 
 io.use((socket, next) => {
   const token = socket.handshake.auth.token;
@@ -76,10 +107,8 @@ io.on('connection', async (socket) => {
   await supabase.from('users').update({ is_online: true, last_seen: new Date().toISOString() }).eq('id', userId);
   io.emit('user_online', { userId });
 
-  // Join personal room
   socket.join(`user:${userId}`);
 
-  // Join group rooms
   const { data: groups } = await supabase
     .from('group_members')
     .select('group_id')
@@ -89,7 +118,6 @@ io.on('connection', async (socket) => {
     socket.join(`group:${g.group_id}`);
   }
 
-  // Send message
   socket.on('send_message', async (data) => {
     const { receiver_id, group_id, content, message_type = 'text', media_url = null } = data;
     const msg = {
@@ -107,7 +135,6 @@ io.on('connection', async (socket) => {
 
     if (group_id) {
       io.to(`group:${group_id}`).emit('new_message', { message, sender: socket.user });
-      // Notify each member
       const { data: members } = await supabase
         .from('group_members')
         .select('user_id')
@@ -140,7 +167,6 @@ io.on('connection', async (socket) => {
     }
   });
 
-  // Typing indicator
   socket.on('typing', ({ receiver_id, group_id, isTyping }) => {
     if (receiver_id) {
       const sid = onlineUsers.get(receiver_id);
@@ -151,7 +177,6 @@ io.on('connection', async (socket) => {
     }
   });
 
-  // Mark messages read
   socket.on('mark_read', async ({ sender_id }) => {
     await supabase.from('messages')
       .update({ is_read: true })
@@ -163,7 +188,6 @@ io.on('connection', async (socket) => {
     if (sid) io.to(sid).emit('messages_read', { reader_id: userId });
   });
 
-  // WebRTC Call Signaling
   socket.on('call_user', async ({ receiver_id, call_type, call_id }) => {
     const receiverSocket = onlineUsers.get(receiver_id);
     if (receiverSocket) {
@@ -175,7 +199,6 @@ io.on('connection', async (socket) => {
         caller_socket: socket.id
       });
     } else {
-      // User offline - log missed call
       await supabase.from('calls').insert({
         caller_id: userId,
         receiver_id,
@@ -233,7 +256,6 @@ io.on('connection', async (socket) => {
     }
   });
 
-  // Status update notification
   socket.on('new_status', async () => {
     const { data: contacts } = await supabase
       .from('contacts')
@@ -258,11 +280,25 @@ io.on('connection', async (socket) => {
   });
 });
 
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n  HexaChat Backend: ${protocol}://0.0.0.0:${PORT}`);
-  console.log(`  Mobile API:       ${protocol}://101.101.184.2:${PORT}`);
-  console.log(`  Voice endpoint:   ${protocol}://101.101.184.2:${PORT}/api/voice/send\n`);
+httpServer.listen(PORT, '0.0.0.0', () => {
+  if (isProduction) {
+    console.log(`\n  HexaChat API (Railway): listening on port ${PORT}`);
+    console.log(`  Frontend: https://hexachat.netlify.app\n`);
+  } else {
+    const ip = getLanIp();
+    console.log(`\n  HexaChat Backend (local): http://${ip}:${PORT}`);
+    console.log(`  Voice API: http://${ip}:${PORT}/api/voice/send`);
+
+    const ssl = loadHttpsOptions();
+    if (ssl) {
+      const https = require('https');
+      https.createServer(ssl, app).listen(5443, '0.0.0.0', () => {
+        console.log(`  HexaChat Backend (HTTPS): https://${ip}:5443\n`);
+      });
+    } else {
+      console.log('');
+    }
+  }
 });
 
 module.exports = { io, onlineUsers };
