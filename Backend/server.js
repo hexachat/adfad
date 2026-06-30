@@ -19,7 +19,7 @@ const groupRoutes = require('./routes/groups');
 const messageRoutes = require('./routes/messages');
 const statusRoutes = require('./routes/status');
 const callRoutes = require('./routes/calls');
-const { getIceServerConfig } = require('./lib/webrtc-ice');
+const { getIceServerConfig, getIceServerConfigSync } = require('./lib/webrtc-ice');
 
 function getAllowedOrigins() {
   const raw =
@@ -99,8 +99,14 @@ app.get('/', (_, res) => {
 
 app.get('/api/health', (_, res) => res.json({ status: 'ok', app: 'HexaChat' }));
 
-app.get('/api/webrtc/ice', (_, res) => {
-  res.json(getIceServerConfig());
+app.get('/api/webrtc/ice', async (_, res) => {
+  try {
+    const config = await getIceServerConfig();
+    res.json(config);
+  } catch (err) {
+    console.error('ICE config error:', err);
+    res.json(getIceServerConfigSync());
+  }
 });
 
 app.get('/api/network', (_, res) => {
