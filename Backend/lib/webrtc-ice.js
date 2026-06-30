@@ -27,8 +27,7 @@ function getIceServerConfig() {
   return {
     iceServers: servers,
     iceCandidatePoolSize: 10,
-    bundlePolicy: 'max-bundle',
-    rtcpMuxPolicy: 'require'
+    iceTransportPolicy: 'all'
   };
 }
 
