@@ -1,232 +1,162 @@
+const express = require('express');
 const supabase = require('../config/supabase');
-const { authMiddleware } = require('../middleware/auth');
-const multer = require('multer');
-const path = require('path');
-const { v4: uuidv4 } = require('uuid');
+const auth = require('../middleware/auth');
 
-const router = require('express').Router();
+const router = express.Router();
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'uploads/'),
-  filename: (req, file, cb) => {
-    let ext = path.extname(file.originalname);
-    if (!ext) {
-      if (file.mimetype?.includes('mp4')) ext = '.mp4';
-      else if (file.mimetype?.includes('ogg')) ext = '.ogg';
-      else ext = '.webm';
-    }
-    cb(null, `${uuidv4()}${ext}`);
-  }
-});
-const upload = multer({
-  storage,
-  limits: { fileSize: 8 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype?.startsWith('audio/') || file.fieldname === 'audio') cb(null, true);
-    else cb(new Error('Audio only'));
-  }
-});
-
-// Get chat list (contacts + groups with last message)
-router.get('/list', authMiddleware, async (req, res) => {
-  const userId = req.user.id;
-
-  // Get contacts with last message
-  const { data: contacts } = await supabase
-    .from('contacts')
-    .select(`
-      id, created_at,
-      contact:contact_user_id (id, name, phone_number, profile_photo, is_online, last_seen)
-    `)
-    .eq('user_id', userId);
-
-  const chatList = [];
-
-  for (const c of (contacts || [])) {
-    const contactId = c.contact.id;
-    const { data: lastMsg } = await supabase
-      .from('messages')
-      .select('*')
-      .or(`and(sender_id.eq.${userId},receiver_id.eq.${contactId}),and(sender_id.eq.${contactId},receiver_id.eq.${userId})`)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    const { count: unread } = await supabase
-      .from('messages')
-      .select('*', { count: 'exact', head: true })
-      .eq('sender_id', contactId)
-      .eq('receiver_id', userId)
-      .eq('is_read', false);
-
-    chatList.push({
-      type: 'contact',
-      id: contactId,
-      contact_id: c.id,
-      name: c.contact.name,
-      phone_number: c.contact.phone_number,
-      profile_photo: c.contact.profile_photo,
-      is_online: c.contact.is_online,
-      last_seen: c.contact.last_seen,
-      last_message: lastMsg || null,
-      unread_count: unread || 0
-    });
-  }
-
-  // Get groups
-  const { data: groupMemberships } = await supabase
-    .from('group_members')
-    .select(`
-      group_id,
-      groups (id, name, profile_photo, created_at)
-    `)
-    .eq('user_id', userId);
-
-  for (const gm of (groupMemberships || [])) {
-    const group = gm.groups;
-    const { data: lastMsg } = await supabase
-      .from('messages')
-      .select('*')
-      .eq('group_id', group.id)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    chatList.push({
-      type: 'group',
-      id: group.id,
-      name: group.name,
-      profile_photo: group.profile_photo,
-      last_message: lastMsg || null,
-      unread_count: 0
-    });
-  }
-
-  chatList.sort((a, b) => {
-    const aTime = a.last_message?.created_at || '1970';
-    const bTime = b.last_message?.created_at || '1970';
-    return new Date(bTime) - new Date(aTime);
-  });
-
-  res.json({ chats: chatList });
-});
-
-// Upload voice message
-router.post('/voice', authMiddleware, upload.single('audio'), async (req, res) => {
+router.get('/conversations', auth, async (req, res) => {
   try {
-    const { receiver_id, group_id, duration = 0 } = req.body;
-    if (!req.file) return res.status(400).json({ error: 'No audio file received' });
-    if (!receiver_id && !group_id) return res.status(400).json({ error: 'Receiver or group required' });
+    const { data: participations } = await supabase
+      .from('conversation_participants')
+      .select(`
+        conversation_id, last_read_at,
+        conversation:conversations(id, type, group_id, updated_at,
+          group:groups(id, name, photo))
+      `)
+      .eq('user_id', req.user.id);
 
-    const msg = {
-      sender_id: req.user.id,
-      content: 'Voice message',
-      message_type: 'audio',
-      media_url: `/uploads/${req.file.filename}`,
-      is_read: false
-    };
-    if (receiver_id) msg.receiver_id = receiver_id;
-    if (group_id) msg.group_id = group_id;
+    const conversations = [];
 
-    const { data: message, error } = await supabase.from('messages').insert(msg).select('*').single();
-    if (error) {
-      console.error('Voice insert error:', error);
-      return res.status(500).json({ error: error.message || 'Failed to save voice message' });
-    }
+    for (const p of participations || []) {
+      const conv = p.conversation;
+      if (!conv) continue;
 
-    const io = req.app.get('io');
-    const sender = { id: req.user.id, name: req.user.name, phone_number: req.user.phone_number };
-    if (io) {
-      if (group_id) {
-        io.to(`group:${group_id}`).emit('new_message', { message, sender });
-      } else if (receiver_id) {
-        io.to(`user:${receiver_id}`).emit('new_message', { message, sender });
-        io.to(`user:${req.user.id}`).emit('new_message', { message, sender });
+      const { data: lastMsg } = await supabase
+        .from('messages')
+        .select('content, message_type, created_at, sender_id')
+        .eq('conversation_id', conv.id)
+        .eq('is_deleted', false)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      const { count: unreadCount } = await supabase
+        .from('messages')
+        .select('*', { count: 'exact', head: true })
+        .eq('conversation_id', conv.id)
+        .gt('created_at', p.last_read_at)
+        .neq('sender_id', req.user.id);
+
+      let displayName = '';
+      let displayPhoto = null;
+      let otherUserId = null;
+
+      if (conv.type === 'group') {
+        displayName = conv.group?.name || 'Group';
+        displayPhoto = conv.group?.photo;
+      } else {
+        const { data: others } = await supabase
+          .from('conversation_participants')
+          .select('user_id, users(id, name, phone_number, profile_photo, is_online, last_seen)')
+          .eq('conversation_id', conv.id)
+          .neq('user_id', req.user.id);
+
+        if (others?.[0]?.users) {
+          displayName = others[0].users.name;
+          displayPhoto = others[0].users.profile_photo;
+          otherUserId = others[0].users.id;
+        }
       }
+
+      conversations.push({
+        id: conv.id,
+        type: conv.type,
+        name: displayName,
+        photo: displayPhoto,
+        otherUserId,
+        groupId: conv.group_id,
+        lastMessage: lastMsg,
+        unreadCount: unreadCount || 0,
+        updatedAt: conv.updated_at
+      });
     }
 
-    res.json({ message });
+    conversations.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    res.json(conversations);
   } catch (err) {
-    console.error('Voice upload error:', err);
-    res.status(500).json({ error: 'Voice message failed' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Get messages with a contact
-router.get('/:contactId', authMiddleware, async (req, res) => {
-  const { contactId } = req.params;
-  const userId = req.user.id;
+router.get('/:conversationId', auth, async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const { before, limit = 50 } = req.query;
 
-  const { data: messages } = await supabase
-    .from('messages')
-    .select('*')
-    .or(`and(sender_id.eq.${userId},receiver_id.eq.${contactId}),and(sender_id.eq.${contactId},receiver_id.eq.${userId})`)
-    .order('created_at', { ascending: true });
+    let query = supabase
+      .from('messages')
+      .select(`
+        id, content, message_type, media_url, media_duration,
+        created_at, sender_id, is_deleted,
+        sender:users(id, name, profile_photo)
+      `)
+      .eq('conversation_id', conversationId)
+      .eq('is_deleted', false)
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit));
 
-  // Mark as read
-  await supabase.from('messages')
-    .update({ is_read: true })
-    .eq('sender_id', contactId)
-    .eq('receiver_id', userId)
-    .eq('is_read', false);
+    if (before) query = query.lt('created_at', before);
 
-  res.json({ messages: messages || [] });
+    const { data: messages } = await query;
+
+    await supabase
+      .from('conversation_participants')
+      .update({ last_read_at: new Date().toISOString() })
+      .eq('conversation_id', conversationId)
+      .eq('user_id', req.user.id);
+
+    res.json((messages || []).reverse());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Get group messages
-router.get('/group/:groupId', authMiddleware, async (req, res) => {
-  const { groupId } = req.params;
+router.post('/send', auth, async (req, res) => {
+  try {
+    const { conversation_id, content, message_type = 'text', media_url, media_duration } = req.body;
 
-  const { data: member } = await supabase
-    .from('group_members')
-    .select('id')
-    .eq('group_id', groupId)
-    .eq('user_id', req.user.id)
-    .single();
-
-  if (!member) return res.status(403).json({ error: 'Not a group member' });
-
-  const { data: messages } = await supabase
-    .from('messages')
-    .select('*')
-    .eq('group_id', groupId)
-    .order('created_at', { ascending: true });
-
-  const enriched = [];
-  for (const msg of (messages || [])) {
-    const { data: sender } = await supabase
-      .from('users')
-      .select('id, name, profile_photo')
-      .eq('id', msg.sender_id)
+    const { data: message, error } = await supabase
+      .from('messages')
+      .insert({
+        conversation_id,
+        sender_id: req.user.id,
+        content,
+        message_type,
+        media_url,
+        media_duration
+      })
+      .select(`
+        id, content, message_type, media_url, media_duration,
+        created_at, sender_id,
+        sender:users(id, name, profile_photo)
+      `)
       .single();
-    enriched.push({ ...msg, sender });
-  }
 
-  res.json({ messages: enriched });
+    if (error) return res.status(500).json({ error: error.message });
+
+    await supabase
+      .from('conversations')
+      .update({ updated_at: new Date().toISOString() })
+      .eq('id', conversation_id);
+
+    res.json(message);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Send message (REST fallback)
-router.post('/send', authMiddleware, async (req, res) => {
-  const { receiver_id, group_id, content, message_type = 'text' } = req.body;
-  if (!content) return res.status(400).json({ error: 'Message content required' });
+router.delete('/:messageId', auth, async (req, res) => {
+  try {
+    await supabase
+      .from('messages')
+      .update({ is_deleted: true })
+      .eq('id', req.params.messageId)
+      .eq('sender_id', req.user.id);
 
-  const msg = {
-    sender_id: req.user.id,
-    content,
-    message_type,
-    is_read: false
-  };
-  if (receiver_id) msg.receiver_id = receiver_id;
-  if (group_id) msg.group_id = group_id;
-
-  const { data: message, error } = await supabase
-    .from('messages')
-    .insert(msg)
-    .select('*')
-    .single();
-
-  if (error) return res.status(500).json({ error: 'Failed to send message' });
-  res.json({ message });
+    res.json({ message: 'Message deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 module.exports = router;

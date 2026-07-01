@@ -1,258 +1,146 @@
 const express = require('express');
-const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const supabase = require('../config/supabase');
-const { formatUser, USER_PUBLIC_SELECT } = require('../config/user-fields');
-const {
-  addReaction,
-  getReactions,
-  getReactionsForStatuses
-} = require('../store/status-reactions-store');
-const authMiddleware = require('../middleware/auth');
+const auth = require('../middleware/auth');
 
 const router = express.Router();
-const ALLOWED_REACTIONS = ['❤️', '😂', '😮', '😢', '👏', '🔥'];
 
-const uploadDir = path.join(__dirname, '..', 'uploads', 'status');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (_, __, cb) => cb(null, uploadDir),
-  filename: (_, file, cb) => cb(null, `status_${Date.now()}${path.extname(file.originalname)}`)
-});
-
-const upload = multer({ storage, limits: { fileSize: 15 * 1024 * 1024 } });
-
-router.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError) {
-    return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Image too large (max 15MB)' : err.message });
-  }
-  next(err);
-});
-
-async function attachStatusMeta(statuses) {
-  if (!statuses?.length) return [];
-
-  const userIds = [...new Set(statuses.map((s) => s.user_id))];
-  let userMap = {};
-  if (userIds.length) {
-    const { data: users } = await supabase
-      .from('users')
-      .select(USER_PUBLIC_SELECT)
-      .in('id', userIds);
-    userMap = Object.fromEntries((users || []).map((u) => [u.id, formatUser(u)]));
-  }
-
-  const statusIds = statuses.map((s) => s.id);
-  let viewsMap = {};
-  if (statusIds.length) {
-    const { data: views } = await supabase
-      .from('status_views')
-      .select('status_id, viewer_id, viewed_at')
-      .in('status_id', statusIds);
-    for (const v of views || []) {
-      if (!viewsMap[v.status_id]) viewsMap[v.status_id] = [];
-      viewsMap[v.status_id].push({ viewer_id: v.viewer_id, viewed_at: v.viewed_at });
-    }
-  }
-
-  const reactionsMap = getReactionsForStatuses(statusIds);
-  const reactorIds = [...new Set(
-    Object.values(reactionsMap).flat().map((r) => r.user_id)
-  )];
-  let reactorMap = {};
-  if (reactorIds.length) {
-    const { data: users } = await supabase
-      .from('users')
-      .select(USER_PUBLIC_SELECT)
-      .in('id', reactorIds);
-    reactorMap = Object.fromEntries((users || []).map((u) => [u.id, formatUser(u)]));
-  }
-
-  return statuses.map((s) => ({
-    ...s,
-    user: userMap[s.user_id] || { id: s.user_id, name: 'User', phone_number: '', profile_photo: null },
-    views: viewsMap[s.id] || [],
-    reactions: (reactionsMap[s.id] || []).map((r) => ({
-      ...r,
-      user: reactorMap[r.user_id] || null
-    }))
-  }));
-}
-
-router.get('/', authMiddleware, async (req, res) => {
+router.get('/', auth, async (req, res) => {
   try {
-    const { data: myContacts, error: contactErr } = await supabase
+    const { data: contactIds } = await supabase
       .from('contacts')
-      .select('contact_id')
+      .select('contact_user_id')
       .eq('user_id', req.user.id);
 
-    if (contactErr) console.error('Status contacts error:', contactErr);
+    const ids = (contactIds || []).map(c => c.contact_user_id);
+    ids.push(req.user.id);
 
-    const contactIds = (myContacts || []).map((c) => c.contact_id);
-    contactIds.push(req.user.id);
-
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-
-    const { data: statuses, error } = await supabase
+    const { data: statuses } = await supabase
       .from('statuses')
-      .select('*')
-      .in('user_id', contactIds)
-      .gte('created_at', since)
+      .select(`
+        id, content, media_url, media_type, background_color,
+        created_at, expires_at, user_id,
+        user:users(id, name, profile_photo),
+        views:status_views(count),
+        reactions:status_reactions(id, reaction, user_id,
+          user:users(id, name))
+      `)
+      .in('user_id', ids)
+      .gt('expires_at', new Date().toISOString())
       .order('created_at', { ascending: false });
 
-    if (error) {
-      console.error('Load statuses error:', error);
-      return res.status(500).json({ error: 'Failed to load statuses' });
+    const grouped = {};
+    for (const s of statuses || []) {
+      if (!grouped[s.user_id]) {
+        grouped[s.user_id] = {
+          user: s.user,
+          statuses: [],
+          hasUnviewed: false
+        };
+      }
+      grouped[s.user_id].statuses.push(s);
     }
 
-    res.json({ statuses: await attachStatusMeta(statuses || []) });
+    // Check unviewed
+    for (const uid of Object.keys(grouped)) {
+      const statusIds = grouped[uid].statuses.map(s => s.id);
+      const { data: views } = await supabase
+        .from('status_views')
+        .select('status_id')
+        .eq('viewer_id', req.user.id)
+        .in('status_id', statusIds);
+
+      const viewedIds = new Set((views || []).map(v => v.status_id));
+      grouped[uid].hasUnviewed = statusIds.some(id => !viewedIds.has(id));
+    }
+
+    res.json(Object.values(grouped));
   } catch (err) {
-    console.error('Status list error:', err);
-    res.status(500).json({ error: 'Failed to load statuses' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/', authMiddleware, upload.single('media'), async (req, res) => {
+router.post('/create', auth, async (req, res) => {
   try {
-    const text = (req.body.text || '').trim();
-    let media_url = null;
-    if (req.file) media_url = `/uploads/status/${req.file.filename}`;
-
-    if (!text && !media_url) {
-      return res.status(400).json({ error: 'Status text or media required' });
-    }
+    const { content, media_url, media_type = 'text', background_color = '#0066FF' } = req.body;
+    const expires_at = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
     const { data: status, error } = await supabase
       .from('statuses')
-      .insert({ user_id: req.user.id, text: text || '', media_url })
+      .insert({
+        user_id: req.user.id,
+        content,
+        media_url,
+        media_type,
+        background_color,
+        expires_at
+      })
       .select('*')
       .single();
 
-    if (error) {
-      console.error('Post status error:', error);
-      return res.status(500).json({ error: 'Failed to post status' });
-    }
-
-    const [formatted] = await attachStatusMeta([status]);
-    res.json({ success: true, status: formatted });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(status);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to post status' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/:id/view', authMiddleware, async (req, res) => {
+router.post('/:statusId/view', auth, async (req, res) => {
   try {
-    await supabase.from('status_views').upsert(
-      { status_id: req.params.id, viewer_id: req.user.id, viewed_at: new Date().toISOString() },
-      { onConflict: 'status_id,viewer_id' }
-    );
-    res.json({ success: true });
+    await supabase.from('status_views').upsert({
+      status_id: req.params.statusId,
+      viewer_id: req.user.id
+    }, { onConflict: 'status_id,viewer_id' });
+
+    res.json({ message: 'Viewed' });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to mark viewed' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/:id/react', authMiddleware, async (req, res) => {
+router.get('/:statusId/viewers', auth, async (req, res) => {
   try {
-    const reaction = (req.body.reaction || '').trim();
-    if (!ALLOWED_REACTIONS.includes(reaction)) {
-      return res.status(400).json({ error: 'Invalid reaction' });
-    }
-
-    const entry = addReaction(req.params.id, req.user.id, reaction);
-    const { data: userRow } = await supabase
-      .from('users')
-      .select(USER_PUBLIC_SELECT)
-      .eq('id', req.user.id)
-      .single();
-
-    res.json({
-      success: true,
-      reaction: { ...entry, user: formatUser(userRow) }
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to react' });
-  }
-});
-
-router.get('/:id/reactions', authMiddleware, async (req, res) => {
-  try {
-    const reactions = getReactions(req.params.id);
-    const userIds = [...new Set(reactions.map((r) => r.user_id))];
-    let userMap = {};
-    if (userIds.length) {
-      const { data: users } = await supabase
-        .from('users')
-        .select(USER_PUBLIC_SELECT)
-        .in('id', userIds);
-      userMap = Object.fromEntries((users || []).map((u) => [u.id, formatUser(u)]));
-    }
-    res.json({
-      reactions: reactions.map((r) => ({ ...r, user: userMap[r.user_id] || null }))
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to load reactions' });
-  }
-});
-
-router.delete('/:id', authMiddleware, async (req, res) => {
-  try {
-    await supabase.from('statuses').delete().eq('id', req.params.id).eq('user_id', req.user.id);
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Failed to delete status' });
-  }
-});
-
-router.get('/:id/views', authMiddleware, async (req, res) => {
-  try {
-    const { data: status } = await supabase
-      .from('statuses')
-      .select('user_id')
-      .eq('id', req.params.id)
-      .single();
-
-    if (!status || status.user_id !== req.user.id) {
-      return res.status(403).json({ error: 'Not your status' });
-    }
-
-    const { data: views } = await supabase
+    const { data: viewers } = await supabase
       .from('status_views')
-      .select('viewer_id, viewed_at')
-      .eq('status_id', req.params.id);
+      .select(`
+        viewed_at,
+        viewer:users(id, name, profile_photo)
+      `)
+      .eq('status_id', req.params.statusId)
+      .order('viewed_at', { ascending: false });
 
-    const reactions = getReactions(req.params.id);
-    const reactionMap = Object.fromEntries(reactions.map((r) => [r.user_id, r.reaction]));
-
-    const allIds = [...new Set([
-      ...(views || []).map((v) => v.viewer_id),
-      ...reactions.map((r) => r.user_id)
-    ])];
-
-    let userMap = {};
-    if (allIds.length) {
-      const { data: users } = await supabase
-        .from('users')
-        .select(USER_PUBLIC_SELECT)
-        .in('id', allIds);
-      userMap = Object.fromEntries((users || []).map((u) => [u.id, formatUser(u)]));
-    }
-
-    res.json({
-      views: (views || []).map((v) => ({
-        ...v,
-        viewer: userMap[v.viewer_id] || null,
-        reaction: reactionMap[v.viewer_id] || null
-      })),
-      reactions: reactions.map((r) => ({
-        ...r,
-        user: userMap[r.user_id] || null
-      }))
-    });
+    res.json(viewers || []);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch views' });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/:statusId/react', auth, async (req, res) => {
+  try {
+    const { reaction } = req.body;
+
+    await supabase.from('status_reactions').upsert({
+      status_id: req.params.statusId,
+      user_id: req.user.id,
+      reaction
+    }, { onConflict: 'status_id,user_id' });
+
+    res.json({ message: 'Reaction added' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/:statusId', auth, async (req, res) => {
+  try {
+    await supabase
+      .from('statuses')
+      .delete()
+      .eq('id', req.params.statusId)
+      .eq('user_id', req.user.id);
+
+    res.json({ message: 'Status deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
