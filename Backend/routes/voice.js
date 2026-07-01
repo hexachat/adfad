@@ -10,18 +10,38 @@ const router = express.Router();
 const uploadsDir = path.join(__dirname, '..', 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
+const MIME_EXT = {
+  'audio/webm': '.webm',
+  'audio/ogg': '.ogg',
+  'audio/mp4': '.m4a',
+  'audio/aac': '.aac',
+  'audio/mpeg': '.mp3',
+  'audio/wav': '.wav',
+  'audio/x-m4a': '.m4a',
+  'application/octet-stream': '.webm'
+};
+
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, path.join(__dirname, '..', 'uploads')),
+  destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
     let ext = path.extname(file.originalname);
-    if (!ext) ext = '.webm';
+    if (!ext || ext === '.') {
+      ext = MIME_EXT[file.mimetype] || '.webm';
+    }
     cb(null, `voice-${uuidv4()}${ext}`);
   }
 });
 
 const upload = multer({
   storage,
-  limits: { fileSize: 8 * 1024 * 1024 }
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('audio/') || file.mimetype === 'application/octet-stream') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only audio files allowed'));
+    }
+  }
 });
 
 router.post('/send', authMiddleware, (req, res) => {
@@ -62,6 +82,7 @@ router.post('/send', authMiddleware, (req, res) => {
           io.to(`group:${group_id}`).emit('new_message', { message, sender });
         } else if (receiver_id) {
           io.to(`user:${receiver_id}`).emit('new_message', { message, sender });
+          io.to(`user:${req.user.id}`).emit('new_message', { message, sender });
         }
       }
 

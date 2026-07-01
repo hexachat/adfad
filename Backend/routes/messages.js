@@ -141,7 +141,7 @@ router.post('/voice', authMiddleware, upload.single('audio'), async (req, res) =
         io.to(`group:${group_id}`).emit('new_message', { message, sender });
       } else if (receiver_id) {
         io.to(`user:${receiver_id}`).emit('new_message', { message, sender });
-        io.to(`user:${req.user.id}`).emit('message_sent', { message });
+        io.to(`user:${req.user.id}`).emit('new_message', { message, sender });
       }
     }
 
