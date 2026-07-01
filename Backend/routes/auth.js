@@ -2,7 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const supabase = require('../config/supabase');
-const { sendOTP } = require('../config/nodemailer');
+const { sendOTPWithTimeout } = require('../config/nodemailer');
 
 const router = express.Router();
 
@@ -28,11 +28,11 @@ router.post('/signup', async (req, res) => {
     }
 
     const { data: existingEmail } = await supabase
-      .from('users').select('id').eq('email', email).single();
+      .from('users').select('id').eq('email', email).maybeSingle();
     if (existingEmail) return res.status(400).json({ error: 'Email already registered' });
 
     const { data: existingPhone } = await supabase
-      .from('users').select('id').eq('phone_number', phone_number).single();
+      .from('users').select('id').eq('phone_number', phone_number).maybeSingle();
     if (existingPhone) return res.status(400).json({ error: 'Phone number already registered' });
 
     const password_hash = await bcrypt.hash(password, 12);
@@ -48,7 +48,12 @@ router.post('/signup', async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
 
     await supabase.from('otps').insert({ email, otp_code: otp, purpose: 'signup', expires_at });
-    await sendOTP(email, otp, 'signup');
+
+    try {
+      await sendOTPWithTimeout(email, otp, 'signup');
+    } catch (emailErr) {
+      console.error('OTP email failed:', emailErr.message);
+    }
 
     res.json({ message: 'OTP sent to your email', userId: user.id, email });
   } catch (err) {
@@ -98,14 +103,20 @@ router.post('/resend-otp', async (req, res) => {
   try {
     const { email, purpose = 'signup' } = req.body;
 
-    const { data: user } = await supabase.from('users').select('id').eq('email', email).single();
+    const { data: user } = await supabase.from('users').select('id').eq('email', email).maybeSingle();
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const otp = generateOTP();
     const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     await supabase.from('otps').insert({ email, otp_code: otp, purpose, expires_at });
-    await sendOTP(email, otp, purpose);
+
+    try {
+      await sendOTPWithTimeout(email, otp, purpose);
+    } catch (emailErr) {
+      console.error('Resend OTP email failed:', emailErr.message);
+      return res.status(500).json({ error: 'Failed to send OTP email. Please try again.' });
+    }
 
     res.json({ message: 'OTP resent successfully' });
   } catch (err) {
@@ -122,7 +133,7 @@ router.post('/login', async (req, res) => {
       .from('users')
       .select('id, name, email, phone_number, password_hash, profile_photo, is_verified')
       .eq('email', email)
-      .single();
+      .maybeSingle();
 
     if (!user) return res.status(401).json({ error: 'Invalid email or password' });
     if (!user.is_verified) return res.status(401).json({ error: 'Please verify your email first' });
@@ -145,14 +156,20 @@ router.post('/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
 
-    const { data: user } = await supabase.from('users').select('id').eq('email', email).single();
+    const { data: user } = await supabase.from('users').select('id').eq('email', email).maybeSingle();
     if (!user) return res.status(404).json({ error: 'Email not found' });
 
     const otp = generateOTP();
     const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
 
     await supabase.from('otps').insert({ email, otp_code: otp, purpose: 'reset', expires_at });
-    await sendOTP(email, otp, 'reset');
+
+    try {
+      await sendOTPWithTimeout(email, otp, 'reset');
+    } catch (emailErr) {
+      console.error('Reset OTP email failed:', emailErr.message);
+      return res.status(500).json({ error: 'Failed to send OTP email. Please try again.' });
+    }
 
     res.json({ message: 'OTP sent to your email' });
   } catch (err) {

@@ -20,9 +20,24 @@ const server = http.createServer(app);
 
 const allowedOrigins = [
   'http://localhost:3000',
+  'http://127.0.0.1:3000',
   'https://hexachat2.netlify.app',
+  'https://www.hexachat2.netlify.app',
   process.env.FRONTEND_URL
 ].filter(Boolean);
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.netlify.app')) {
+      callback(null, true);
+    } else {
+      callback(null, true);
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
 
 const io = new Server(server, {
   cors: {
@@ -32,9 +47,23 @@ const io = new Server(server, {
   }
 });
 
-app.use(cors({ origin: allowedOrigins, credentials: true }));
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+app.get('/', (req, res) => {
+  res.json({
+    app: 'HexaChat API',
+    status: 'running',
+    version: '1.0.0',
+    health: '/api/health',
+    docs: 'This is the HexaChat backend. Frontend: https://hexachat2.netlify.app'
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', app: 'HexaChat', version: '1.0.0' });
+});
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', app: 'HexaChat', version: '1.0.0' });
@@ -48,6 +77,15 @@ app.use('/api/messages', messageRoutes);
 app.use('/api/status', statusRoutes);
 app.use('/api/calls', callRoutes);
 app.use('/api/upload', uploadRoutes);
+
+app.use((req, res) => {
+  res.status(404).json({ error: `Route not found: ${req.method} ${req.path}` });
+});
+
+app.use((err, req, res, next) => {
+  console.error('Server error:', err.message);
+  res.status(500).json({ error: err.message || 'Internal server error' });
+});
 
 setupSocket(io);
 
