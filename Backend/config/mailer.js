@@ -1,18 +1,43 @@
 const nodemailer = require('nodemailer');
 
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD
+function getGmailPassword() {
+  return (process.env.GMAIL_APP_PASSWORD || '').replace(/\s+/g, '');
+}
+
+function createTransporter() {
+  const user = process.env.GMAIL_USER;
+  const pass = getGmailPassword();
+
+  if (!user || !pass) {
+    return null;
   }
-});
+
+  return nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    auth: { user, pass },
+    connectionTimeout: 12000,
+    greetingTimeout: 12000,
+    socketTimeout: 15000,
+    tls: { rejectUnauthorized: true }
+  });
+}
+
+let transporter = createTransporter();
 
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
 async function sendOTPEmail(email, otp, type = 'signup') {
+  if (!transporter) {
+    transporter = createTransporter();
+  }
+  if (!transporter) {
+    throw new Error('Email not configured on server (GMAIL_USER / GMAIL_APP_PASSWORD)');
+  }
+
   const subject = type === 'signup'
     ? 'HexaChat - Verify Your Email'
     : 'HexaChat - Reset Your Password';
@@ -37,4 +62,26 @@ async function sendOTPEmail(email, otp, type = 'signup') {
   });
 }
 
-module.exports = { generateOTP, sendOTPEmail };
+/** Send email with timeout — never blocks longer than ms */
+async function sendOTPEmailWithTimeout(email, otp, type = 'signup', ms = 12000) {
+  return Promise.race([
+    sendOTPEmail(email, otp, type),
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Email server timeout')), ms);
+    })
+  ]);
+}
+
+/** Fire-and-forget background send (logs errors only) */
+function sendOTPEmailBackground(email, otp, type = 'signup') {
+  sendOTPEmailWithTimeout(email, otp, type, 20000).catch(err => {
+    console.error('Background OTP email failed:', err.message);
+  });
+}
+
+module.exports = {
+  generateOTP,
+  sendOTPEmail,
+  sendOTPEmailWithTimeout,
+  sendOTPEmailBackground
+};
