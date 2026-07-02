@@ -3,12 +3,9 @@
   "version": "1.0.0",
   "description": "HexaChat Backend API",
   "main": "server.js",
-  "engines": {
-    "node": ">=22"
-  },
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "node server.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",
@@ -21,8 +18,5 @@
     "nodemailer": "^6.9.16",
     "socket.io": "^4.8.1",
     "uuid": "^11.0.5"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.9"
   }
 }

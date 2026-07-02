@@ -1,98 +1,94 @@
 const express = require('express');
 const supabase = require('../config/supabase');
-const auth = require('../middleware/auth');
+const { authMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
 
-router.get('/', auth, async (req, res) => {
+// Search users by name or phone
+router.get('/search', authMiddleware, async (req, res) => {
   try {
-    const { data: contacts } = await supabase
-      .from('contacts')
-      .select(`
-        id, contact_name, created_at,
-        contact_user:users!contacts_contact_user_id_fkey(
-          id, name, phone_number, profile_photo, is_online, last_seen
-        )
-      `)
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false });
+    const { q } = req.query;
+    if (!q) return res.json({ users: [] });
 
-    res.json(contacts || []);
+    const { data: users } = await supabase.from('users')
+      .select('id, name, phone, avatar_url, last_seen')
+      .or(`name.ilike.%${q}%,phone.ilike.%${q}%`)
+      .neq('id', req.user.id)
+      .limit(20);
+
+    res.json({ users: users || [] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/add', auth, async (req, res) => {
+// Add contact by phone number
+router.post('/add', authMiddleware, async (req, res) => {
   try {
-    const { phone_number, contact_name } = req.body;
+    const { phone } = req.body;
+    const { data: contactUser } = await supabase.from('users')
+      .select('id, name, phone, avatar_url, last_seen')
+      .eq('phone', phone).single();
 
-    const { data: targetUser } = await supabase
-      .from('users')
-      .select('id, name, phone_number, profile_photo')
-      .eq('phone_number', phone_number)
-      .single();
+    if (!contactUser) return res.status(404).json({ error: 'User not found with this number' });
+    if (contactUser.id === req.user.id) return res.status(400).json({ error: 'Cannot add yourself' });
 
-    if (!targetUser) return res.status(404).json({ error: 'No user found with this number' });
-    if (targetUser.id === req.user.id) return res.status(400).json({ error: 'Cannot add yourself' });
+    const { data: existing } = await supabase.from('contacts')
+      .select('id').eq('user_id', req.user.id).eq('contact_user_id', contactUser.id).single();
 
-    const { data: existing } = await supabase
-      .from('contacts')
-      .select('id')
-      .eq('user_id', req.user.id)
-      .eq('contact_user_id', targetUser.id)
-      .single();
+    if (existing) return res.status(400).json({ error: 'Contact already added' });
 
-    if (existing) return res.status(400).json({ error: 'Contact already exists' });
+    await supabase.from('contacts').insert({
+      user_id: req.user.id, contact_user_id: contactUser.id
+    });
 
-    const { data: contact, error } = await supabase
-      .from('contacts')
-      .insert({
-        user_id: req.user.id,
-        contact_user_id: targetUser.id,
-        contact_name: contact_name || targetUser.name
-      })
-      .select(`
-        id, contact_name,
-        contact_user:users!contacts_contact_user_id_fkey(
-          id, name, phone_number, profile_photo, is_online, last_seen
-        )
-      `)
-      .single();
-
-    if (error) return res.status(500).json({ error: error.message });
+    // Also add reverse contact
+    const { data: reverseExists } = await supabase.from('contacts')
+      .select('id').eq('user_id', contactUser.id).eq('contact_user_id', req.user.id).single();
+    if (!reverseExists) {
+      await supabase.from('contacts').insert({
+        user_id: contactUser.id, contact_user_id: req.user.id
+      });
+    }
 
     // Create or get direct conversation
-    let conversationId = await getOrCreateDirectConversation(req.user.id, targetUser.id);
+    let conversationId = await getOrCreateDirectConversation(req.user.id, contactUser.id);
 
-    res.json({ contact, conversationId });
+    res.json({ contact: contactUser, conversationId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get all contacts
+router.get('/', authMiddleware, async (req, res) => {
+  try {
+    const { data: contacts } = await supabase.from('contacts')
+      .select('contact_user_id, users:contact_user_id(id, name, phone, avatar_url, last_seen)')
+      .eq('user_id', req.user.id);
+
+    const contactList = (contacts || []).map(c => c.users);
+    res.json({ contacts: contactList });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 async function getOrCreateDirectConversation(userId1, userId2) {
-  const { data: convs } = await supabase
-    .from('conversation_participants')
+  const { data: existing } = await supabase.from('conversation_participants')
     .select('conversation_id, conversations!inner(type)')
-    .eq('user_id', userId1)
-    .eq('conversations.type', 'direct');
+    .eq('user_id', userId1);
 
-  for (const c of convs || []) {
-    const { data: other } = await supabase
-      .from('conversation_participants')
-      .select('user_id')
-      .eq('conversation_id', c.conversation_id)
-      .eq('user_id', userId2)
-      .single();
-    if (other) return c.conversation_id;
+  for (const ep of existing || []) {
+    if (ep.conversations?.type === 'direct') {
+      const { data: other } = await supabase.from('conversation_participants')
+        .select('user_id').eq('conversation_id', ep.conversation_id).eq('user_id', userId2).single();
+      if (other) return ep.conversation_id;
+    }
   }
 
-  const { data: conv } = await supabase
-    .from('conversations')
-    .insert({ type: 'direct' })
-    .select('id')
-    .single();
+  const { data: conv } = await supabase.from('conversations')
+    .insert({ type: 'direct' }).select('id').single();
 
   await supabase.from('conversation_participants').insert([
     { conversation_id: conv.id, user_id: userId1 },
@@ -103,4 +99,3 @@ async function getOrCreateDirectConversation(userId1, userId2) {
 }
 
 module.exports = router;
-module.exports.getOrCreateDirectConversation = getOrCreateDirectConversation;

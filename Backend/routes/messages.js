@@ -1,159 +1,117 @@
 const express = require('express');
 const supabase = require('../config/supabase');
-const auth = require('../middleware/auth');
+const { authMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
 
-router.get('/conversations', auth, async (req, res) => {
+// Get all conversations for user
+router.get('/', authMiddleware, async (req, res) => {
   try {
-    const { data: participations } = await supabase
-      .from('conversation_participants')
-      .select(`
-        conversation_id, last_read_at,
-        conversation:conversations(id, type, group_id, updated_at,
-          group:groups(id, name, photo))
-      `)
+    const { data: participations } = await supabase.from('conversation_participants')
+      .select('conversation_id')
       .eq('user_id', req.user.id);
 
     const conversations = [];
-
     for (const p of participations || []) {
-      const conv = p.conversation;
+      const { data: conv } = await supabase.from('conversations')
+        .select('*').eq('id', p.conversation_id).single();
       if (!conv) continue;
 
-      const { data: lastMsg } = await supabase
-        .from('messages')
+      let chatInfo = {};
+      if (conv.type === 'direct') {
+        const { data: others } = await supabase.from('conversation_participants')
+          .select('user_id, users:user_id(id, name, phone, avatar_url, last_seen)')
+          .eq('conversation_id', conv.id).neq('user_id', req.user.id);
+        chatInfo = others?.[0]?.users || {};
+      } else {
+        const { data: group } = await supabase.from('groups')
+          .select('id, name, avatar_url').eq('id', conv.group_id).single();
+        chatInfo = group || {};
+      }
+
+      const { data: lastMsg } = await supabase.from('messages')
         .select('content, message_type, created_at, sender_id')
         .eq('conversation_id', conv.id)
-        .eq('is_deleted', false)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
+        .order('created_at', { ascending: false }).limit(1).single();
 
-      const { count: unreadCount } = await supabase
-        .from('messages')
+      const { count: unreadCount } = await supabase.from('messages')
         .select('*', { count: 'exact', head: true })
         .eq('conversation_id', conv.id)
-        .gt('created_at', p.last_read_at)
-        .neq('sender_id', req.user.id);
-
-      let displayName = '';
-      let displayPhoto = null;
-      let otherUserId = null;
-
-      if (conv.type === 'group') {
-        displayName = conv.group?.name || 'Group';
-        displayPhoto = conv.group?.photo;
-      } else {
-        const { data: others } = await supabase
-          .from('conversation_participants')
-          .select('user_id, users(id, name, phone_number, profile_photo, is_online, last_seen)')
-          .eq('conversation_id', conv.id)
-          .neq('user_id', req.user.id);
-
-        if (others?.[0]?.users) {
-          displayName = others[0].users.name;
-          displayPhoto = others[0].users.profile_photo;
-          otherUserId = others[0].users.id;
-        }
-      }
+        .neq('sender_id', req.user.id)
+        .eq('is_read', false);
 
       conversations.push({
         id: conv.id,
         type: conv.type,
-        name: displayName,
-        photo: displayPhoto,
-        otherUserId,
-        groupId: conv.group_id,
+        userId: chatInfo.id || null,
+        name: chatInfo.name,
+        phone: chatInfo.phone,
+        avatar_url: chatInfo.avatar_url,
+        last_seen: chatInfo.last_seen,
+        group_id: conv.group_id,
         lastMessage: lastMsg,
-        unreadCount: unreadCount || 0,
-        updatedAt: conv.updated_at
+        unreadCount: unreadCount || 0
       });
     }
 
-    conversations.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
-    res.json(conversations);
+    conversations.sort((a, b) => {
+      const ta = a.lastMessage?.created_at || '';
+      const tb = b.lastMessage?.created_at || '';
+      return tb.localeCompare(ta);
+    });
+
+    res.json({ conversations });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.get('/:conversationId', auth, async (req, res) => {
+// Get messages for a conversation
+router.get('/:id/messages', authMiddleware, async (req, res) => {
   try {
-    const { conversationId } = req.params;
-    const { before, limit = 50 } = req.query;
+    const { id } = req.params;
+    const { before } = req.query;
 
-    let query = supabase
-      .from('messages')
-      .select(`
-        id, content, message_type, media_url, media_duration,
-        created_at, sender_id, is_deleted,
-        sender:users(id, name, profile_photo)
-      `)
-      .eq('conversation_id', conversationId)
-      .eq('is_deleted', false)
+    let query = supabase.from('messages')
+      .select('*, sender:users!sender_id(id, name, phone, avatar_url)')
+      .eq('conversation_id', id)
       .order('created_at', { ascending: false })
-      .limit(parseInt(limit));
+      .limit(50);
 
     if (before) query = query.lt('created_at', before);
 
     const { data: messages } = await query;
 
-    await supabase
-      .from('conversation_participants')
-      .update({ last_read_at: new Date().toISOString() })
-      .eq('conversation_id', conversationId)
-      .eq('user_id', req.user.id);
+    // Mark as read
+    await supabase.from('messages')
+      .update({ is_read: true })
+      .eq('conversation_id', id)
+      .neq('sender_id', req.user.id)
+      .eq('is_read', false);
 
-    res.json((messages || []).reverse());
+    res.json({ messages: (messages || []).reverse() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/send', auth, async (req, res) => {
+// Send message
+router.post('/:id/messages', authMiddleware, async (req, res) => {
   try {
-    const { conversation_id, content, message_type = 'text', media_url, media_duration } = req.body;
+    const { id } = req.params;
+    const { content, message_type = 'text', media_url, media_duration } = req.body;
 
-    const { data: message, error } = await supabase
-      .from('messages')
-      .insert({
-        conversation_id,
-        sender_id: req.user.id,
-        content,
-        message_type,
-        media_url,
-        media_duration
-      })
-      .select(`
-        id, content, message_type, media_url, media_duration,
-        created_at, sender_id,
-        sender:users(id, name, profile_photo)
-      `)
-      .single();
+    const { data: message, error } = await supabase.from('messages').insert({
+      conversation_id: id,
+      sender_id: req.user.id,
+      content,
+      message_type,
+      media_url,
+      media_duration
+    }).select('*, sender:users!sender_id(id, name, phone, avatar_url)').single();
 
     if (error) return res.status(500).json({ error: error.message });
-
-    await supabase
-      .from('conversations')
-      .update({ updated_at: new Date().toISOString() })
-      .eq('id', conversation_id);
-
-    res.json(message);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.delete('/:messageId', auth, async (req, res) => {
-  try {
-    await supabase
-      .from('messages')
-      .update({ is_deleted: true })
-      .eq('id', req.params.messageId)
-      .eq('sender_id', req.user.id);
-
-    res.json({ message: 'Message deleted' });
+    res.json({ message });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
