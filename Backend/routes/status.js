@@ -4,127 +4,99 @@ const { authMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Create status
-router.post('/', authMiddleware, async (req, res) => {
-  try {
-    const { content_type, content, media_url, background_color } = req.body;
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+router.get('/', authMiddleware, async (req, res) => {
+  const { data: contacts } = await supabase
+    .from('contacts')
+    .select(`contact:users!contacts_contact_id_fkey(id, name, phone_number, profile_photo)`)
+    .eq('user_id', req.userId);
 
-    const { data: status } = await supabase.from('statuses').insert({
-      user_id: req.user.id,
-      content_type,
+  const contactIds = (contacts || []).map(c => c.contact.id);
+  contactIds.push(req.userId);
+
+  const { data: statuses } = await supabase
+    .from('statuses')
+    .select(`
+      *, user:users(id, name, phone_number, profile_photo)
+    `)
+    .in('user_id', contactIds)
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: false });
+
+  const grouped = {};
+  for (const s of statuses || []) {
+    if (!grouped[s.user_id]) grouped[s.user_id] = { user: s.user, statuses: [] };
+    grouped[s.user_id].statuses.push(s);
+  }
+
+  const { data: myStatuses } = await supabase
+    .from('statuses')
+    .select('*')
+    .eq('user_id', req.userId)
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: false });
+
+  res.json({ statusGroups: Object.values(grouped), myStatuses: myStatuses || [] });
+});
+
+router.post('/create', authMiddleware, async (req, res) => {
+  const { content, media_url, media_type, background_color } = req.body;
+  const expires_at = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+  const { data: status, error } = await supabase
+    .from('statuses')
+    .insert({
+      user_id: req.userId,
       content,
       media_url,
-      background_color: background_color || '#0066FF',
-      expires_at: expiresAt
-    }).select('*').single();
+      media_type: media_type || 'text',
+      background_color: background_color || '#000000',
+      expires_at
+    })
+    .select(`*, user:users(id, name, phone_number, profile_photo)`)
+    .single();
 
-    res.json({ status });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  if (error) return res.status(500).json({ error: error.message });
+
+  const io = req.app.get('io');
+  io.emit('new_status', status);
+
+  res.json({ status });
 });
 
-// Get all active statuses from contacts
-router.get('/', authMiddleware, async (req, res) => {
-  try {
-    const { data: contacts } = await supabase.from('contacts')
-      .select('contact_user_id').eq('user_id', req.user.id);
+router.post('/:statusId/view', authMiddleware, async (req, res) => {
+  await supabase.from('status_views').upsert({
+    status_id: req.params.statusId,
+    viewer_id: req.userId
+  }, { onConflict: 'status_id,viewer_id' });
 
-    const contactIds = (contacts || []).map(c => c.contact_user_id);
-    contactIds.push(req.user.id);
-
-    const { data: statuses } = await supabase.from('statuses')
-      .select('*, user:users!user_id(id, name, phone, avatar_url)')
-      .in('user_id', contactIds)
-      .gt('expires_at', new Date().toISOString())
-      .order('created_at', { ascending: false });
-
-    // Group by user
-    const grouped = {};
-    for (const s of statuses || []) {
-      if (!grouped[s.user_id]) {
-        grouped[s.user_id] = { user: s.user, statuses: [], viewed: false };
-      }
-      grouped[s.user_id].statuses.push(s);
-    }
-
-    // Check views
-    for (const uid of Object.keys(grouped)) {
-      const statusIds = grouped[uid].statuses.map(s => s.id);
-      const { data: views } = await supabase.from('status_views')
-        .select('status_id').eq('viewer_id', req.user.id).in('status_id', statusIds);
-      grouped[uid].viewed = (views || []).length === statusIds.length;
-    }
-
-    res.json({ statusGroups: Object.values(grouped) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  res.json({ success: true });
 });
 
-// My statuses (must be before /:id routes)
-router.get('/mine/list', authMiddleware, async (req, res) => {
-  try {
-    const { data: statuses } = await supabase.from('statuses')
-      .select('*').eq('user_id', req.user.id)
-      .gt('expires_at', new Date().toISOString())
-      .order('created_at', { ascending: false });
-    res.json({ statuses: statuses || [] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+router.get('/:statusId/views', authMiddleware, async (req, res) => {
+  const { data: views } = await supabase
+    .from('status_views')
+    .select(`viewer:users(id, name, profile_photo, phone_number), viewed_at`)
+    .eq('status_id', req.params.statusId);
+
+  res.json({ views: (views || []).map(v => ({ ...v.viewer, viewed_at: v.viewed_at })) });
 });
 
-// View status
-router.post('/:id/view', authMiddleware, async (req, res) => {
-  try {
-    await supabase.from('status_views').upsert({
-      status_id: req.params.id,
-      viewer_id: req.user.id
-    }, { onConflict: 'status_id,viewer_id' });
-    res.json({ message: 'Viewed' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+router.post('/:statusId/react', authMiddleware, async (req, res) => {
+  const { reaction } = req.body;
+  await supabase.from('status_reactions').upsert({
+    status_id: req.params.statusId,
+    user_id: req.userId,
+    reaction
+  }, { onConflict: 'status_id,user_id' });
+
+  res.json({ success: true });
 });
 
-// Get viewers of a status
-router.get('/:id/viewers', authMiddleware, async (req, res) => {
-  try {
-    const { data: views } = await supabase.from('status_views')
-      .select('*, viewer:users!viewer_id(id, name, phone, avatar_url)')
-      .eq('status_id', req.params.id);
-    res.json({ viewers: (views || []).map(v => ({ ...v.viewer, viewed_at: v.viewed_at })) });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// React to status
-router.post('/:id/react', authMiddleware, async (req, res) => {
-  try {
-    const { reaction } = req.body;
-    await supabase.from('status_reactions').upsert({
-      status_id: req.params.id,
-      user_id: req.user.id,
-      reaction
-    }, { onConflict: 'status_id,user_id' });
-    res.json({ message: 'Reacted' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Delete status
-router.delete('/:id', authMiddleware, async (req, res) => {
-  try {
-    await supabase.from('statuses').delete()
-      .eq('id', req.params.id).eq('user_id', req.user.id);
-    res.json({ message: 'Deleted' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+router.delete('/:statusId', authMiddleware, async (req, res) => {
+  await supabase.from('statuses').delete()
+    .eq('id', req.params.statusId)
+    .eq('user_id', req.userId);
+  res.json({ success: true });
 });
 
 module.exports = router;

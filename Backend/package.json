@@ -1,14 +1,11 @@
 {
   "name": "hexachat-backend",
   "version": "1.0.0",
-  "description": "HexaChat Backend API",
+  "description": "HexaChat Backend API with Socket.io and WebRTC signaling",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
-  },
-  "engines": {
-    "node": ">=22"
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",
@@ -21,5 +18,11 @@
     "nodemailer": "^6.9.16",
     "socket.io": "^4.8.1",
     "uuid": "^11.0.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

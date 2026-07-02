@@ -4,63 +4,49 @@ const { authMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
 
-// Get call history
 router.get('/', authMiddleware, async (req, res) => {
-  try {
-    const { data: calls } = await supabase.from('calls')
-      .select(`
-        *,
-        caller:users!caller_id(id, name, phone, avatar_url),
-        receiver:users!receiver_id(id, name, phone, avatar_url)
-      `)
-      .or(`caller_id.eq.${req.user.id},receiver_id.eq.${req.user.id}`)
-      .order('started_at', { ascending: false })
-      .limit(50);
+  const { data: calls } = await supabase
+    .from('call_history')
+    .select(`
+      *,
+      caller:users!call_history_caller_id_fkey(id, name, phone_number, profile_photo),
+      receiver:users!call_history_receiver_id_fkey(id, name, phone_number, profile_photo)
+    `)
+    .or(`caller_id.eq.${req.userId},receiver_id.eq.${req.userId}`)
+    .order('started_at', { ascending: false })
+    .limit(50);
 
-    res.json({ calls: calls || [] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  res.json({ calls: calls || [] });
 });
 
-// Log call
 router.post('/log', authMiddleware, async (req, res) => {
-  try {
-    const { receiver_id, call_type, status, duration } = req.body;
-    const { data: call } = await supabase.from('calls').insert({
-      caller_id: req.user.id,
-      receiver_id,
-      call_type,
-      status,
-      duration: duration || 0,
-      ended_at: status === 'ended' ? new Date().toISOString() : null,
-      answered_at: status === 'answered' ? new Date().toISOString() : null
-    }).select('*').single();
+  const { receiver_id, call_type, status, duration } = req.body;
 
-    res.json({ call });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const { data: call, error } = await supabase
+    .from('call_history')
+    .insert({
+      caller_id: req.userId,
+      receiver_id,
+      call_type: call_type || 'voice',
+      status: status || 'answered',
+      duration: duration || 0,
+      ended_at: new Date().toISOString()
+    })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ call });
 });
 
-// Update call status
-router.put('/:id', authMiddleware, async (req, res) => {
-  try {
-    const { status, duration } = req.body;
-    const updates = { status };
-    if (status === 'answered') updates.answered_at = new Date().toISOString();
-    if (status === 'ended' || status === 'missed' || status === 'rejected') {
-      updates.ended_at = new Date().toISOString();
-      if (duration) updates.duration = duration;
-    }
+router.put('/:callId', authMiddleware, async (req, res) => {
+  const { status, duration } = req.body;
+  const updates = { ended_at: new Date().toISOString() };
+  if (status) updates.status = status;
+  if (duration !== undefined) updates.duration = duration;
 
-    const { data: call } = await supabase.from('calls')
-      .update(updates).eq('id', req.params.id).select('*').single();
-
-    res.json({ call });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  await supabase.from('call_history').update(updates).eq('id', req.params.callId);
+  res.json({ success: true });
 });
 
 module.exports = router;

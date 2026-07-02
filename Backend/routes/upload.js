@@ -1,48 +1,69 @@
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
+const supabase = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
-const uploadDir = path.join(__dirname, '..', 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+async function uploadToSupabase(file, bucket, folder) {
+  const ext = file.originalname.split('.').pop();
+  const fileName = `${folder}/${uuidv4()}.${ext}`;
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${uuidv4()}${ext}`);
+  const { error } = await supabase.storage
+    .from(bucket)
+    .upload(fileName, file.buffer, { contentType: file.mimetype, upsert: true });
+
+  if (error) throw error;
+
+  const { data } = supabase.storage.from(bucket).getPublicUrl(fileName);
+  return data.publicUrl;
+}
+
+router.post('/profile-photo', authMiddleware, upload.single('photo'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const url = await uploadToSupabase(req.file, 'profile-photos', req.userId);
+    await supabase.from('users').update({ profile_photo: url }).eq('id', req.userId);
+    res.json({ url });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ error: 'Upload failed' });
   }
 });
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const allowed = /jpeg|jpg|png|gif|webp|mp4|webm|mp3|wav|ogg|pdf|doc|docx/;
-    const ext = allowed.test(path.extname(file.originalname).toLowerCase());
-    const mime = allowed.test(file.mimetype.split('/')[1]);
-    cb(null, ext || mime);
+router.post('/attachment', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const url = await uploadToSupabase(req.file, 'chat-attachments', req.userId);
+    res.json({ url, name: req.file.originalname, type: req.file.mimetype });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ error: 'Upload failed' });
   }
 });
 
-router.post('/', authMiddleware, upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+router.post('/voice-note', authMiddleware, upload.single('audio'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No audio uploaded' });
+    const url = await uploadToSupabase(req.file, 'voice-notes', req.userId);
+    res.json({ url });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
 
-  const baseUrl = process.env.RAILWAY_PUBLIC_DOMAIN
-    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-    : process.env.BACKEND_URL || `https://hexachat-production.up.railway.app`;
-
-  const url = `${baseUrl}/uploads/${req.file.filename}`;
-  res.json({
-    url,
-    filename: req.file.filename,
-    mimetype: req.file.mimetype,
-    size: req.file.size
-  });
+router.post('/status-media', authMiddleware, upload.single('media'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const url = await uploadToSupabase(req.file, 'status-media', req.userId);
+    res.json({ url });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ error: 'Upload failed' });
+  }
 });
 
 module.exports = router;
