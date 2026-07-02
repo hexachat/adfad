@@ -1,15 +1,31 @@
 const nodemailer = require('nodemailer');
 
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD
-  },
-  connectionTimeout: 10000,
-  greetingTimeout: 10000,
-  socketTimeout: 15000
-});
+function createTransporter() {
+  const user = process.env.GMAIL_USER;
+  const pass = (process.env.GMAIL_APP_PASSWORD || '').replace(/\s/g, '');
+
+  if (!user || !pass) {
+    throw new Error('GMAIL_USER or GMAIL_APP_PASSWORD missing in environment');
+  }
+
+  return nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false,
+    requireTLS: true,
+    auth: { user, pass },
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,
+    socketTimeout: 30000,
+    tls: { minVersion: 'TLSv1.2' }
+  });
+}
+
+const transporter = createTransporter();
+
+async function verifyEmailConfig() {
+  await createTransporter().verify();
+}
 
 async function sendOTP(email, otp, purpose) {
   const subject = purpose === 'signup'
@@ -28,21 +44,25 @@ async function sendOTP(email, otp, purpose) {
     </div>
   `;
 
-  await transporter.sendMail({
+  const info = await createTransporter().sendMail({
     from: `"HexaChat" <${process.env.GMAIL_USER}>`,
     to: email,
     subject,
-    html
+    html,
+    text: `Your HexaChat OTP is: ${otp}. It expires in 10 minutes.`
   });
+
+  console.log('Email sent:', info.messageId);
+  return info;
 }
 
-function sendOTPWithTimeout(email, otp, purpose, ms = 15000) {
+async function sendOTPWithTimeout(email, otp, purpose, ms = 30000) {
   return Promise.race([
     sendOTP(email, otp, purpose),
     new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Email delivery timed out')), ms)
+      setTimeout(() => reject(new Error('Email delivery timed out after 30s')), ms)
     )
   ]);
 }
 
-module.exports = { sendOTP, sendOTPWithTimeout };
+module.exports = { sendOTP, sendOTPWithTimeout, verifyEmailConfig };

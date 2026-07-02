@@ -49,13 +49,23 @@ router.post('/signup', async (req, res) => {
 
     await supabase.from('otps').insert({ email, otp_code: otp, purpose: 'signup', expires_at });
 
+    let emailSent = false;
+    let emailError = null;
     try {
-      await sendOTPWithTimeout(email, otp, 'signup');
+      await sendOTPWithTimeout(email, otp, 'signup', 30000);
+      emailSent = true;
     } catch (emailErr) {
-      console.error('OTP email failed:', emailErr.message);
+      emailError = emailErr.message;
+      console.error('OTP email failed for', email, ':', emailErr.message);
     }
 
-    res.json({ message: 'OTP sent to your email', userId: user.id, email });
+    res.json({
+      message: emailSent ? 'OTP sent to your email' : 'Account created but email could not be sent. Tap Resend OTP.',
+      userId: user.id,
+      email,
+      emailSent,
+      emailError: emailSent ? undefined : emailError
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -228,6 +238,28 @@ router.post('/reset-password', async (req, res) => {
     await supabase.from('otps').update({ is_used: true }).eq('id', otpRecord.id);
 
     res.json({ message: 'Password updated successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Demo / test OTP email
+router.post('/test-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    const target = email || 'knowledgeislamic8@gmail.com';
+    const otp = generateOTP();
+    const expires_at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+    await supabase.from('otps').insert({
+      email: target,
+      otp_code: otp,
+      purpose: 'signup',
+      expires_at
+    });
+
+    await sendOTPWithTimeout(target, otp, 'signup', 30000);
+    res.json({ message: 'Demo OTP sent', email: target, otp });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
